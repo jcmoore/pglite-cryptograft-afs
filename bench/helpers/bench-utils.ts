@@ -3,15 +3,31 @@ import {
   createTestDir,
   cleanupTestDir,
   createEncryptedPGlite,
+  createCryptograftPGlite,
 } from '../../test/helpers/test-utils.js'
 
-export { createTestDir, cleanupTestDir, createEncryptedPGlite }
+export {
+  createTestDir,
+  cleanupTestDir,
+  createEncryptedPGlite,
+  createCryptograftPGlite,
+}
 
 export interface BenchPair {
   plainDb: PGlite
   encDb: PGlite
   plainDir: string
   encDir: string
+  cleanup: () => Promise<void>
+}
+
+export interface BenchTriple {
+  plainDb: PGlite
+  encDb: PGlite
+  cgDb: PGlite
+  plainDir: string
+  encDir: string
+  cgDir: string
   cleanup: () => Promise<void>
 }
 
@@ -50,6 +66,49 @@ export async function createBenchPair(
   }
 
   return { plainDb, encDb, plainDir, encDir, cleanup }
+}
+
+/**
+ * Creates plain, EncryptedFS, and CryptograftAFS PGlite instances
+ * with the same schema applied to all three.
+ */
+export async function createBenchTriple(
+  schema: string,
+  extensions?: Record<string, unknown>,
+): Promise<BenchTriple> {
+  const plainDir = createTestDir()
+  const encDir = createTestDir()
+  const cgDir = createTestDir()
+
+  const plainDb = await PGlite.create({
+    dataDir: plainDir,
+    ...(extensions ? { extensions } : {}),
+  })
+
+  const { db: encDb } = await createEncryptedPGlite(
+    encDir,
+    'bench-passphrase',
+    extensions,
+  )
+  const { db: cgDb, fs: cgFs } = await createCryptograftPGlite(cgDir, extensions)
+
+  if (schema) {
+    await plainDb.exec(schema)
+    await encDb.exec(schema)
+    await cgDb.exec(schema)
+  }
+
+  const cleanup = async () => {
+    await plainDb.close()
+    await encDb.close()
+    await cgDb.close()
+    await cgFs.closeFs()
+    cleanupTestDir(plainDir)
+    cleanupTestDir(encDir)
+    cleanupTestDir(cgDir)
+  }
+
+  return { plainDb, encDb, cgDb, plainDir, encDir, cgDir, cleanup }
 }
 
 /**

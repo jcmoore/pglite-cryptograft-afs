@@ -1,5 +1,5 @@
 import { describe, bench } from 'vitest'
-import { createBenchPair, generateInsertSQL } from './helpers/bench-utils.js'
+import { createBenchTriple, generateInsertSQL } from './helpers/bench-utils.js'
 
 const SCHEMA = `
   CREATE TABLE bench_data (
@@ -9,10 +9,11 @@ const SCHEMA = `
   CREATE INDEX idx_bench_data ON bench_data (id);
 `
 
-const pair = await createBenchPair(SCHEMA)
+const pair = await createBenchTriple(SCHEMA)
 const seedSQL = generateInsertSQL('bench_data', 1000)
 await pair.plainDb.exec(seedSQL)
 await pair.encDb.exec(seedSQL)
+await pair.cgDb.exec(seedSQL)
 
 describe('insert', () => {
   bench('plain - insert 100 rows', async () => {
@@ -30,6 +31,13 @@ describe('insert', () => {
       await pair.encDb.exec(`INSERT INTO bench_data (data) VALUES ('row_${i}')`)
     }
   })
+
+  bench('cryptograft - insert 100 rows', async () => {
+    await pair.cgDb.exec('TRUNCATE bench_data')
+    for (let i = 0; i < 100; i++) {
+      await pair.cgDb.exec(`INSERT INTO bench_data (data) VALUES ('row_${i}')`)
+    }
+  })
 })
 
 describe('bulk insert', () => {
@@ -43,6 +51,12 @@ describe('bulk insert', () => {
     await pair.encDb.exec('TRUNCATE bench_data')
     const sql = generateInsertSQL('bench_data', 1000)
     await pair.encDb.exec(sql)
+  })
+
+  bench('cryptograft - bulk insert 1000 rows', async () => {
+    await pair.cgDb.exec('TRUNCATE bench_data')
+    const sql = generateInsertSQL('bench_data', 1000)
+    await pair.cgDb.exec(sql)
   })
 })
 
@@ -58,6 +72,12 @@ describe('insert large text', () => {
     const sql = generateInsertSQL('bench_data', 50, 10240)
     await pair.encDb.exec(sql)
   })
+
+  bench('cryptograft - insert large text (10KB x 50)', async () => {
+    await pair.cgDb.exec('TRUNCATE bench_data')
+    const sql = generateInsertSQL('bench_data', 50, 10240)
+    await pair.cgDb.exec(sql)
+  })
 })
 
 describe('select rows', () => {
@@ -67,6 +87,10 @@ describe('select rows', () => {
 
   bench('encrypted - select 1000 rows', async () => {
     await pair.encDb.exec('SELECT * FROM bench_data')
+  })
+
+  bench('cryptograft - select 1000 rows', async () => {
+    await pair.cgDb.exec('SELECT * FROM bench_data')
   })
 })
 
@@ -82,6 +106,12 @@ describe('select with index', () => {
       'SELECT * FROM bench_data WHERE id BETWEEN 100 AND 200',
     )
   })
+
+  bench('cryptograft - select with index', async () => {
+    await pair.cgDb.exec(
+      'SELECT * FROM bench_data WHERE id BETWEEN 100 AND 200',
+    )
+  })
 })
 
 describe('aggregate', () => {
@@ -91,6 +121,10 @@ describe('aggregate', () => {
 
   bench('encrypted - aggregate (COUNT/SUM)', async () => {
     await pair.encDb.exec('SELECT COUNT(*), SUM(id) FROM bench_data')
+  })
+
+  bench('cryptograft - aggregate (COUNT/SUM)', async () => {
+    await pair.cgDb.exec('SELECT COUNT(*), SUM(id) FROM bench_data')
   })
 })
 
@@ -122,6 +156,20 @@ describe('mixed CRUD', () => {
         `UPDATE bench_data SET data = 'updated' WHERE id = ${id}`,
       )
       await pair.encDb.exec(`DELETE FROM bench_data WHERE id = ${id}`)
+    }
+  })
+
+  bench('cryptograft - mixed CRUD cycle', async () => {
+    await pair.cgDb.exec("INSERT INTO bench_data (data) VALUES ('crud_test')")
+    const res = await pair.cgDb.query<{ id: number }>(
+      "SELECT id FROM bench_data WHERE data = 'crud_test' LIMIT 1",
+    )
+    if (res.rows.length > 0) {
+      const id = res.rows[0].id
+      await pair.cgDb.exec(
+        `UPDATE bench_data SET data = 'updated' WHERE id = ${id}`,
+      )
+      await pair.cgDb.exec(`DELETE FROM bench_data WHERE id = ${id}`)
     }
   })
 })

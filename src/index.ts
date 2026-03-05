@@ -1,4 +1,5 @@
 export { EncryptedFS, type EncryptedFSOptions } from './encrypted-fs.js'
+export { CryptograftAFS, type CryptograftAFSOptions } from './cryptograft-afs.js'
 
 export {
   PAGE_SIZE,

@@ -17,14 +17,15 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc",
-    "typecheck": "tsc --noEmit",
+    "build": "bun x tsc",
+    "typecheck": "bun x tsc --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write \"src/**/*.{ts,js}\"",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "bench": "vitest bench --config vitest.bench.config.ts",
+    "test": "bun --bun ./node_modules/vitest/vitest.mjs run",
+    "test:watch": "bun --bun ./node_modules/vitest/vitest.mjs",
+    "bench": "bun --bun ./node_modules/vitest/vitest.mjs bench --config vitest.bench.config.ts",
+    "example:pglite-cryptograft": "SQLITE3MC_DYLIB=/tmp/libsqlite3mc.dylib GRAFT_EXT_DYLIB=../../../../../../modules/github.com/orbitinghail/graft/v/0/target/debug/libgraft_ext.dylib SQLITE3MC_CIPHER=xchacha20 SQLITE3MC_KEY=cryptograft-demo-key bun examples/pglite-cryptograft.ts",
     "prepublishOnly": "pnpm run typecheck && pnpm run lint && pnpm run build"
   },
   "keywords": [
@@ -49,6 +50,7 @@
   "homepage": "https://github.com/davidmuggleton/pglite-encrypted-fs#readme",
   "engines": {
     "node": ">=20",
+    "bun": ">=1.3.0",
     "pnpm": ">=9"
   },
   "packageManager": "pnpm@10.12.3",
@@ -58,6 +60,7 @@
   "devDependencies": {
     "@electric-sql/pglite": "^0.3.15",
     "@eslint/js": "^10.0.1",
+    "@types/bun": "^1.3.10",
     "@types/node": "^25.3.0",
     "eslint": "^10.0.1",
     "prettier": "^3.8.1",

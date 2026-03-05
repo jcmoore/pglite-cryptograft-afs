@@ -68,6 +68,27 @@ const db = await PGlite.create({ dataDir, fs })
 
 If the passphrase is wrong, the constructor throws immediately with `"Invalid passphrase or corrupted encryption keys"`.
 
+## CryptograftAFS (SQLite-Backed, Experimental)
+
+This package also includes an experimental `CryptograftAFS` implementation that stores the virtual filesystem in a host SQLite database using per-inode chunk tables.
+
+```typescript
+import { PGlite } from '@electric-sql/pglite'
+import { CryptograftAFS } from 'pglite-encrypted-fs'
+
+const dataDir = './my-cryptograft-db'
+const fs = new CryptograftAFS(dataDir, {
+  // optional, for sqlite3mc builds
+  sqliteLibraryPath: process.env.SQLITE3MC_DYLIB,
+})
+const db = await PGlite.create({ dataDir, fs })
+
+await db.exec('CREATE TABLE t (id SERIAL PRIMARY KEY, v TEXT)')
+await db.exec(\"INSERT INTO t (v) VALUES ('ok')\")
+```
+
+`CryptograftAFS` is Bun-first (`bun:sqlite`) and intended as the integration point for custom SQLite builds/extensions.
+
 ## pgvector Example
 
 PGlite extensions work normally on top of the encrypted VFS. Here's pgvector:
@@ -228,13 +249,13 @@ Read operations have near-zero overhead because data is decrypted when pages are
 | Platform | Supported |
 |----------|-----------|
 | Node.js (>=20) | Yes |
-| Bun | Yes (untested) |
+| Bun | Yes |
 | Deno | No |
 | Chrome | No |
 | Safari | No |
 | Firefox | No |
 
-This package uses Node.js `crypto` and `fs` modules and is not compatible with browser environments.
+`EncryptedFS` uses Node.js `crypto` and `fs` modules. `CryptograftAFS` uses `bun:sqlite` and is Bun-first. Neither filesystem is browser-compatible in the current package.
 
 ## FAQ
 

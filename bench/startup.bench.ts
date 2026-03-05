@@ -1,7 +1,11 @@
 import { describe, bench } from 'vitest'
 import { PGlite } from '@electric-sql/pglite'
 import { EncryptedFS } from '../src/index.js'
-import { createTestDir, createEncryptedPGlite } from './helpers/bench-utils.js'
+import {
+  createTestDir,
+  createEncryptedPGlite,
+  createCryptograftPGlite,
+} from './helpers/bench-utils.js'
 
 describe('fresh init', () => {
   bench(
@@ -23,11 +27,23 @@ describe('fresh init', () => {
     },
     { iterations: 3, warmupIterations: 1, time: 0 },
   )
+
+  bench(
+    'cryptograft - fresh init',
+    async () => {
+      const dir = createTestDir()
+      const { db, fs } = await createCryptograftPGlite(dir)
+      await db.close()
+      await fs.closeFs()
+    },
+    { iterations: 3, warmupIterations: 1, time: 0 },
+  )
 })
 
 describe('reopen', () => {
   let plainDir: string
   let encDir: string
+  let cgDir: string
 
   bench(
     'plain - reopen',
@@ -54,6 +70,22 @@ describe('reopen', () => {
       const encFs = new EncryptedFS(encDir, 'bench-passphrase')
       const db = await PGlite.create({ dataDir: encDir, fs: encFs })
       await db.close()
+    },
+    { iterations: 3, warmupIterations: 1, time: 0 },
+  )
+
+  bench(
+    'cryptograft - reopen',
+    async () => {
+      if (!cgDir) {
+        cgDir = createTestDir()
+        const { db, fs } = await createCryptograftPGlite(cgDir)
+        await db.close()
+        await fs.closeFs()
+      }
+      const { db, fs } = await createCryptograftPGlite(cgDir)
+      await db.close()
+      await fs.closeFs()
     },
     { iterations: 3, warmupIterations: 1, time: 0 },
   )

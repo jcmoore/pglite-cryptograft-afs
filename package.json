@@ -24,6 +24,9 @@
     "format": "prettier --write \"src/**/*.{ts,js}\"",
     "test": "bun --bun ./node_modules/vitest/vitest.mjs run",
     "test:watch": "bun --bun ./node_modules/vitest/vitest.mjs",
+    "build:sqlite3mc": "bash ./scripts/build-sqlite3mc.sh",
+    "clean:sqlite3mc": "bash ./scripts/clean-sqlite3mc-artifacts.sh",
+    "test:sqlite3mc": "bash ./scripts/run-sqlite3mc-tests.sh",
     "bench": "bun --bun ./node_modules/vitest/vitest.mjs bench --config vitest.bench.config.ts",
     "example:pglite-cryptograft": "SQLITE3MC_DYLIB=/tmp/libsqlite3mc.dylib GRAFT_EXT_DYLIB=../../../../../../modules/github.com/orbitinghail/graft/v/0/target/debug/libgraft_ext.dylib SQLITE3MC_CIPHER=xchacha20 SQLITE3MC_KEY=cryptograft-demo-key bun examples/pglite-cryptograft.ts",
     "prepublishOnly": "pnpm run typecheck && pnpm run lint && pnpm run build"

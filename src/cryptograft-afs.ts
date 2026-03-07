@@ -5,6 +5,8 @@ import {
 } from '@electric-sql/pglite/basefs'
 import type { PGlite } from '@electric-sql/pglite'
 import { Database as BunDatabase } from 'bun:sqlite'
+import sodium from 'libsodium-wrappers-sumo'
+import { pbkdf2Sync, randomBytes } from 'node:crypto'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 
@@ -16,7 +18,20 @@ const S_IFDIR = 0o040000
 
 const DEFAULT_DIR_MODE = S_IFDIR | 0o755
 const DEFAULT_CHUNK_SIZE = 8192
-const DEFAULT_SQLITE_PAGE_SIZE = 65536
+const DEFAULT_SQLITE_PAGE_SIZE = 4096
+const DEFAULT_GRAFT_TAG = 'cryptograft-afs.main'
+const DEFAULT_GRAFT_STATE_DIRNAME = '.cryptograft-graft'
+const ALLOWED_SQLITE_PAGE_SIZES = new Set([4096, 8192, 16384, 32768, 65536])
+const CHUNK_HEADER_SALT_SIZE = 16
+const CHUNK_HEADER_FILE_ID_SIZE = 32
+const CHUNK_HEADER_SIZE = CHUNK_HEADER_SALT_SIZE + CHUNK_HEADER_FILE_ID_SIZE
+const CHUNK_NONCE_SIZE = 24
+const CHUNK_TAG_SIZE = 16
+const CHUNK_META_SIZE = CHUNK_NONCE_SIZE + CHUNK_TAG_SIZE
+const KDF_ITERATIONS = 256000
+const KDF_DIGEST = 'sha512'
+const VERIFICATION_TOKEN_NAME = '.encryption-verify'
+const VERIFICATION_MAGIC = Buffer.from('CRYPTOGRAFT_VERIFY_V1')
 
 const O_WRONLY = 1
 const O_RDWR = 2
@@ -29,6 +44,8 @@ const WASM_PREFIX = '/tmp/pglite'
 const PGDATA = WASM_PREFIX + '/base'
 let bunSQLiteInitialized = false
 let configuredSQLiteLibraryPath: string | null = null
+
+await sodium.ready
 
 interface EmModule {
   FS: EmFS
@@ -111,13 +128,39 @@ interface OpenFile {
   isDir: boolean
 }
 
+interface FileHeaderParts {
+  salt: Buffer
+  fileId: Buffer
+}
+
+interface FileCryptoContext {
+  fileId: Buffer
+}
+
 export interface CryptograftAFSOptions {
   debug?: boolean
-  dbPath?: string
   sqliteLibraryPath?: string
+  sqlitePageSize?: number
   chunkSize?: number
+  initializeSchema?: boolean
   pragmas?: string[]
-  loadExtensions?: string[]
+  graftExtensionPath?: string
+  graftTag?: string
+  graftSwitch?: string
+  graftConfigPath?: string
+  graftDataDir?: string
+  graftRemoteType?: 'memory' | 'fs'
+  graftRemoteRoot?: string
+}
+
+function resolveSqlitePageSize(value: number | undefined): number {
+  const pageSize = value ?? DEFAULT_SQLITE_PAGE_SIZE
+  if (!ALLOWED_SQLITE_PAGE_SIZES.has(pageSize)) {
+    throw new Error(
+      `Unsupported sqlitePageSize '${pageSize}'. Allowed values: 4096, 8192, 16384, 32768, 65536.`,
+    )
+  }
+  return pageSize
 }
 
 function emFlagsToNode(flags: number | string): string {
@@ -165,127 +208,511 @@ function nowSec(): number {
   return Math.floor(Date.now() / 1000)
 }
 
+function tomlEscape(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+}
+
+function sqlEscape(value: string): string {
+  return value.replace(/'/g, "''")
+}
+
+function buildChunkAad(fileId: Buffer, chunkIndex: number): Buffer {
+  if (!Number.isInteger(chunkIndex) || chunkIndex < 0) {
+    throw new Error(`Invalid chunk index: ${chunkIndex}`)
+  }
+  const indexBuf = Buffer.alloc(8)
+  indexBuf.writeBigUInt64BE(BigInt(chunkIndex))
+  return Buffer.concat([fileId, indexBuf])
+}
+
+function parseChunkMeta(meta: Uint8Array): { nonce: Buffer; tag: Buffer } {
+  const buf = Buffer.from(meta)
+  if (buf.length !== CHUNK_META_SIZE) {
+    throw new Error(`Invalid chunk meta length: ${buf.length}`)
+  }
+  return {
+    nonce: buf.subarray(0, CHUNK_NONCE_SIZE),
+    tag: buf.subarray(CHUNK_NONCE_SIZE),
+  }
+}
+
+function buildChunkMeta(nonce: Buffer, tag: Buffer): Buffer {
+  if (nonce.length !== CHUNK_NONCE_SIZE) {
+    throw new Error(`Invalid nonce length: ${nonce.length}`)
+  }
+  if (tag.length !== CHUNK_TAG_SIZE) {
+    throw new Error(`Invalid auth tag length: ${tag.length}`)
+  }
+  return Buffer.concat([nonce, tag])
+}
+
+function parseFileHeader(header: Uint8Array): FileHeaderParts {
+  const buf = Buffer.from(header)
+  if (buf.length !== CHUNK_HEADER_SIZE) {
+    throw new Error(`Invalid fs_inode.header length: ${buf.length}`)
+  }
+  return {
+    salt: buf.subarray(0, CHUNK_HEADER_SALT_SIZE),
+    fileId: buf.subarray(CHUNK_HEADER_SALT_SIZE),
+  }
+}
+
+export function initializeCryptograftDatabase(
+  baseDir: string,
+  options: CryptograftAFSOptions,
+  sqlitePageSize: number
+): BunDatabase {
+  if (!fs.existsSync(baseDir)) {
+    fs.mkdirSync(baseDir, { recursive: true })
+  }
+
+  const graftStateDir = path.join(baseDir, DEFAULT_GRAFT_STATE_DIRNAME)
+  const graftDataDir = options.graftDataDir ?? path.join(graftStateDir, 'data')
+  const graftConfigPath =
+    options.graftConfigPath ?? path.join(graftStateDir, 'graft.toml')
+  const graftRemoteType =
+    options.graftRemoteType ?? (options.graftRemoteRoot ? 'fs' : 'memory')
+  const graftRemoteRoot = options.graftRemoteRoot ?? path.join(graftStateDir, 'remote')
+
+  if (!fs.existsSync(path.dirname(graftConfigPath))) {
+    fs.mkdirSync(path.dirname(graftConfigPath), { recursive: true })
+  }
+  if (!fs.existsSync(graftDataDir)) {
+    fs.mkdirSync(graftDataDir, { recursive: true })
+  }
+  if (graftRemoteType === 'fs' && !fs.existsSync(graftRemoteRoot)) {
+    fs.mkdirSync(graftRemoteRoot, { recursive: true })
+  }
+
+  if (!fs.existsSync(graftConfigPath)) {
+    const remoteConfig =
+      graftRemoteType === 'fs'
+        ? `[remote]\ntype = "fs"\nroot = "${tomlEscape(graftRemoteRoot)}"\n`
+        : `[remote]\ntype = "memory"\n`
+    fs.writeFileSync(
+      graftConfigPath,
+      `data_dir = "${tomlEscape(graftDataDir)}"\n\n${remoteConfig}`,
+    )
+  }
+
+  process.env.GRAFT_CONFIG = graftConfigPath
+  process.env.GRAFT_DATA_DIR = graftDataDir
+  process.env.GRAFT_REMOTE__TYPE = graftRemoteType
+  if (graftRemoteType === 'fs') {
+    process.env.GRAFT_REMOTE__ROOT = graftRemoteRoot
+  } else {
+    delete process.env.GRAFT_REMOTE__ROOT
+  }
+
+  const graftExtensionPath = options.graftExtensionPath ?? process.env.GRAFT_EXT_DYLIB
+  if (!graftExtensionPath) {
+    throw new Error(
+      'CryptograftAFS requires graft extension path. Set options.graftExtensionPath (or GRAFT_EXT_DYLIB).',
+    )
+  }
+
+  if (options.sqliteLibraryPath) {
+    if (configuredSQLiteLibraryPath) {
+      if (configuredSQLiteLibraryPath !== options.sqliteLibraryPath) {
+        throw new Error(
+          `Custom SQLite already configured with '${configuredSQLiteLibraryPath}'. ` +
+            `Requested '${options.sqliteLibraryPath}'.`,
+        )
+      }
+    } else if (bunSQLiteInitialized) {
+      throw new Error(
+        'Cannot set custom SQLite after SQLite has already been initialized. ' +
+          'Construct CryptograftAFS with sqliteLibraryPath before opening any SQLite databases.',
+      )
+    } else {
+      BunDatabase.setCustomSQLite(options.sqliteLibraryPath)
+      configuredSQLiteLibraryPath = options.sqliteLibraryPath
+    }
+  }
+
+  const bootstrap = new BunDatabase(':memory:')
+  bootstrap.loadExtension(graftExtensionPath)
+  bootstrap.close()
+
+  const graftTag = options.graftTag ?? DEFAULT_GRAFT_TAG
+  const dbUri = `file:${graftTag}?vfs=graft`
+  const db = new BunDatabase(dbUri)
+  bunSQLiteInitialized = true
+
+  if (options.graftSwitch) {
+    db.exec(`PRAGMA graft_switch = '${sqlEscape(options.graftSwitch)}';`)
+  }
+
+  for (const pragma of options.pragmas ?? []) {
+    db.exec(pragma)
+  }
+
+  const hasSchema = db
+    .query("SELECT 1 as one FROM sqlite_master WHERE type='table' AND name='fs_inode'")
+    .get() as { one: number } | undefined
+  if (!hasSchema) {
+    db.exec(`PRAGMA page_size=${sqlitePageSize};`)
+  }
+  db.exec('PRAGMA journal_mode=MEMORY; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;')
+
+  return db
+}
+
+export function initializeSchema(db: BunDatabase): BunDatabase {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS fs_inode (
+      ino INTEGER PRIMARY KEY AUTOINCREMENT,
+      mode INTEGER NOT NULL,
+      nlink INTEGER NOT NULL DEFAULT 0,
+      uid INTEGER NOT NULL DEFAULT 0,
+      gid INTEGER NOT NULL DEFAULT 0,
+      size INTEGER NOT NULL DEFAULT 0,
+      atime INTEGER NOT NULL,
+      mtime INTEGER NOT NULL,
+      ctime INTEGER NOT NULL,
+      rdev INTEGER NOT NULL DEFAULT 0,
+      chunk_size INTEGER NOT NULL DEFAULT ${DEFAULT_CHUNK_SIZE},
+      header BLOB NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS fs_dentry (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      parent_ino INTEGER NOT NULL,
+      ino INTEGER NOT NULL,
+      UNIQUE(parent_ino, name)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_fs_dentry_parent
+    ON fs_dentry(parent_ino, name);
+
+    CREATE TABLE IF NOT EXISTS fs_symlink (
+      ino INTEGER PRIMARY KEY,
+      target TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS fs_config (
+      key TEXT PRIMARY KEY CHECK (key IN ('schema_version')),
+      value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS fs_verification (
+      name TEXT PRIMARY KEY CHECK (name IN ('.encryption-verify')),
+      header BLOB NOT NULL CHECK (length(header) = ${CHUNK_HEADER_SIZE}),
+      meta BLOB NOT NULL CHECK (length(meta) = ${CHUNK_META_SIZE}),
+      data BLOB NOT NULL
+    );
+  `)
+
+  db
+    .query(`
+      INSERT OR REPLACE INTO fs_config (key, value)
+      VALUES ('schema_version', '0.5-cryptograft-basefs')
+    `)
+    .run()
+
+  const root = db
+    .query('SELECT ino FROM fs_inode WHERE ino = 1')
+    .get() as { ino: number } | undefined
+
+  if (!root) {
+    const now = nowSec()
+    db
+      .query(`
+        INSERT INTO fs_inode (ino, mode, nlink, uid, gid, size, atime, mtime, ctime, chunk_size, header)
+        VALUES (1, ?, 1, 0, 0, 0, ?, ?, ?, 0, NULL)
+      `)
+      .run(DEFAULT_DIR_MODE, now, now, now)
+  }
+
+  return db;
+}
+
 export class CryptograftAFS extends BaseFilesystem {
   private readonly db: BunDatabase
   private readonly chunkSize: number
+  private readonly sqlitePageSize: number
+  private cryptoSalt: Buffer
+  private masterKey: Buffer
+  private readonly fileCryptoCache = new Map<number, FileCryptoContext>()
   private openFiles: Map<number, OpenFile> = new Map()
   private cwd = '/'
   private nextFd = 100
 
-  constructor(dataDir: string, options: CryptograftAFSOptions = {}) {
+  private destroyed = false
+
+  constructor(dataDir: string, passphrase: string, options: CryptograftAFSOptions = {}, db?: BunDatabase) {
     super(dataDir, options.debug === undefined ? {} : { debug: options.debug })
 
     const baseDir = this.dataDir ?? dataDir
     this.chunkSize = options.chunkSize ?? DEFAULT_CHUNK_SIZE
+    this.sqlitePageSize = resolveSqlitePageSize(options.sqlitePageSize)
 
-    if (!fs.existsSync(baseDir)) {
-      fs.mkdirSync(baseDir, { recursive: true })
-    }
+    if (db) {
+      const hasVerificationTable = db
+        .query("SELECT 1 as one FROM sqlite_master WHERE type='table' AND name='fs_verification'")
+        .get() as { one: number } | undefined
 
-    const dbPath = options.dbPath ?? path.join(baseDir, '.cryptograft-fs.sqlite')
-    const isFreshDb = !fs.existsSync(dbPath) || fs.statSync(dbPath).size === 0
-    if (options.sqliteLibraryPath) {
-      if (configuredSQLiteLibraryPath) {
-        if (configuredSQLiteLibraryPath !== options.sqliteLibraryPath) {
-          throw new Error(
-            `Custom SQLite already configured with '${configuredSQLiteLibraryPath}'. ` +
-              `Requested '${options.sqliteLibraryPath}'.`,
-          )
-        }
-      } else if (bunSQLiteInitialized) {
-        throw new Error(
-          'Cannot set custom SQLite after SQLite has already been initialized. ' +
-            'Construct CryptograftAFS with sqliteLibraryPath before opening any SQLite databases.',
+      if (!hasVerificationTable) {
+        throw this.createError('EIO', "Pre-initialized database is missing required table 'fs_verification'")
+      }
+
+      this.db = db;
+    } else {
+      this.db = initializeSchema(
+        initializeCryptograftDatabase(
+          baseDir,
+          options,
+          this.sqlitePageSize
         )
-      } else {
-        BunDatabase.setCustomSQLite(options.sqliteLibraryPath)
-        configuredSQLiteLibraryPath = options.sqliteLibraryPath
-      }
+      );
     }
 
-    this.db = new BunDatabase(dbPath)
-    bunSQLiteInitialized = true
+    const existingVerificationHeader = this.db
+      .query('SELECT header FROM fs_verification WHERE name = ?')
+      .get(VERIFICATION_TOKEN_NAME) as { header: Uint8Array } | undefined
 
-    if (options.loadExtensions?.length) {
-      for (const ext of options.loadExtensions) {
-        this.db.loadExtension(ext)
-      }
+    if (existingVerificationHeader) {
+      const parsedHeader = parseFileHeader(existingVerificationHeader.header)
+      this.cryptoSalt = Buffer.from(parsedHeader.salt)
+    } else if (!db) {
+      this.cryptoSalt = Buffer.from(randomBytes(CHUNK_HEADER_SALT_SIZE))
+    } else {
+      throw this.createError('EIO', "Pre-initialized database is missing '.encryption-verify' token")
     }
 
-    for (const pragma of options.pragmas ?? []) {
-      this.db.exec(pragma)
-    }
-    if (isFreshDb) {
-      this.db.exec(`PRAGMA page_size=${DEFAULT_SQLITE_PAGE_SIZE};`)
-    }
-    this.db.exec('PRAGMA journal_mode=MEMORY; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;')
+    this.masterKey = pbkdf2Sync(
+      passphrase,
+      this.cryptoSalt,
+      KDF_ITERATIONS,
+      sodium.crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
+      KDF_DIGEST,
+    )
 
-    this.initializeSchema()
+    this.verifyOrCreateToken()
+
+    if (this.debug) {
+      console.log('CryptograftAFS initialized with dataDir:', baseDir)
+    }
   }
 
-  async closeFs(): Promise<void> {
+  /**
+   * Zeros key material from memory. Call this after closing PGlite.
+   * While JavaScript cannot guarantee complete erasure (the GC may have
+   * copied data), this reduces the window of exposure in heap dumps.
+   */
+  destroy(): void {
+    if (this.destroyed) return
+
+    this.masterKey.fill(0)
+    this.cryptoSalt.fill(0)
+
+    for (const context of this.fileCryptoCache.values()) {
+      context.fileId.fill(0)
+    }
+
+    this.fileCryptoCache.clear()
+
     this.db.close()
+
+    this.destroyed = true
   }
 
-  private initializeSchema(): void {
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS fs_inode (
-        ino INTEGER PRIMARY KEY AUTOINCREMENT,
-        mode INTEGER NOT NULL,
-        nlink INTEGER NOT NULL DEFAULT 0,
-        uid INTEGER NOT NULL DEFAULT 0,
-        gid INTEGER NOT NULL DEFAULT 0,
-        size INTEGER NOT NULL DEFAULT 0,
-        atime INTEGER NOT NULL,
-        mtime INTEGER NOT NULL,
-        ctime INTEGER NOT NULL,
-        rdev INTEGER NOT NULL DEFAULT 0,
-        chunk_size INTEGER NOT NULL DEFAULT ${DEFAULT_CHUNK_SIZE},
-        header BLOB NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS fs_dentry (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        parent_ino INTEGER NOT NULL,
-        ino INTEGER NOT NULL,
-        UNIQUE(parent_ino, name)
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_fs_dentry_parent
-      ON fs_dentry(parent_ino, name);
-
-      CREATE TABLE IF NOT EXISTS fs_symlink (
-        ino INTEGER PRIMARY KEY,
-        target TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS fs_config (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-    `)
-
-    this.db
-      .query(`
-        INSERT OR REPLACE INTO fs_config (key, value)
-        VALUES ('schema_version', '0.5-cryptograft-basefs')
-      `)
-      .run()
-
-    const root = this.db
-      .query('SELECT ino FROM fs_inode WHERE ino = 1')
-      .get() as { ino: number } | undefined
-
-    if (!root) {
-      const now = nowSec()
-      this.db
-        .query(`
-          INSERT INTO fs_inode (ino, mode, nlink, uid, gid, size, atime, mtime, ctime, chunk_size, header)
-          VALUES (1, ?, 1, 0, 0, 0, ?, ?, ?, ?, NULL)
-        `)
-        .run(DEFAULT_DIR_MODE, now, now, now, this.chunkSize)
+  /**
+   * On first init, creates a verification token.
+   * On reopen, decrypts it to verify the passphrase is correct.
+   * Throws immediately if the passphrase is wrong.
+   */
+  private verifyOrCreateToken(): void {
+    const cryptoSalt = this.cryptoSalt
+    if (!cryptoSalt) {
+      throw this.createError('EIO', 'No filesystem salt available for verification token')
     }
+
+    const row = this.db
+      .query('SELECT header, meta, data FROM fs_verification WHERE name = ?')
+      .get(VERIFICATION_TOKEN_NAME) as
+      | { header: Uint8Array; meta: Uint8Array; data: Uint8Array }
+      | undefined
+
+    if (!row) {
+      const existingUserData = this.db
+        .query('SELECT 1 as one FROM fs_inode WHERE ino > 1 LIMIT 1')
+        .get() as { one: number } | undefined
+
+      if (existingUserData) {
+        throw new Error('Invalid passphrase or corrupted encryption keys')
+      }
+
+      const fileId = Buffer.from(randomBytes(CHUNK_HEADER_FILE_ID_SIZE))
+      const header = Buffer.concat([cryptoSalt, fileId])
+      const nonce = Buffer.from(randomBytes(CHUNK_NONCE_SIZE))
+      const aad = buildChunkAad(fileId, 0)
+      const encrypted = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt_detached(
+        VERIFICATION_MAGIC,
+        aad,
+        null,
+        nonce,
+        this.masterKey,
+      )
+      const meta = buildChunkMeta(nonce, Buffer.from(encrypted.mac))
+      const data = Buffer.from(encrypted.ciphertext)
+
+      this.db
+        .query('INSERT INTO fs_verification (name, header, meta, data) VALUES (?, ?, ?, ?)')
+        .run(VERIFICATION_TOKEN_NAME, header, meta, data)
+    } else {
+      try {
+        const parsedHeader = parseFileHeader(row.header)
+        if (!parsedHeader.salt.equals(cryptoSalt)) {
+          throw new Error('Verification token salt mismatch')
+        }
+  
+        const parsedMeta = parseChunkMeta(row.meta)
+        const aad = buildChunkAad(Buffer.from(parsedHeader.fileId), 0)
+        const plaintext = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt_detached(
+          null,
+          row.data,
+          parsedMeta.tag,
+          aad,
+          parsedMeta.nonce,
+          this.masterKey,
+        )
+  
+        if (!Buffer.from(plaintext).equals(VERIFICATION_MAGIC)) {
+          throw new Error('Verification token mismatch')
+        }
+      } catch (cause) {
+        throw Object.assign(
+          new Error('Invalid passphrase or corrupted encryption keys'),
+          { cause },
+        )
+      }
+    }
+  }
+
+  private graftPragma(name: string): string {
+    const row = this.db.query(`PRAGMA ${name};`).get() as Record<string, unknown> | null
+    if (!row) return ''
+    const first = Object.values(row)[0]
+    return typeof first === 'string' ? first : String(first)
+  }
+
+  graftPush(): string {
+    return this.graftPragma('graft_push')
+  }
+
+  graftPull(): string {
+    return this.graftPragma('graft_pull')
+  }
+
+  graftInfo(): string {
+    return this.graftPragma('graft_info')
+  }
+
+  private requireMasterKey(): Buffer {
+    if (!this.masterKey) {
+      throw this.createError('EIO', 'No key material available for chunk encryption')
+    }
+    return this.masterKey
+  }
+
+  private newFileHeaderBlob(): Buffer {
+    this.requireMasterKey()
+    if (!this.cryptoSalt) {
+      throw this.createError('EIO', 'No filesystem salt available for chunk encryption')
+    }
+    const fileId = Buffer.from(randomBytes(CHUNK_HEADER_FILE_ID_SIZE))
+    return Buffer.concat([this.cryptoSalt, fileId])
+  }
+
+  private loadFileCryptoContext(ino: number, createHeaderIfMissing: boolean): FileCryptoContext | null {
+    if (!this.masterKey) {
+      return null
+    }
+
+    const cached = this.fileCryptoCache.get(ino)
+    if (cached) {
+      return cached
+    }
+
+    const row = this.db
+      .query('SELECT header FROM fs_inode WHERE ino = ?')
+      .get(ino) as { header: Uint8Array | null } | undefined
+    if (!row) {
+      throw this.createError('ENOENT', `inode ${ino} not found`)
+    }
+
+    let headerBlob = row.header
+    if (!headerBlob) {
+      if (!createHeaderIfMissing) {
+        return null
+      }
+      const newHeader = this.newFileHeaderBlob()
+      this.db.query('UPDATE fs_inode SET header = ? WHERE ino = ?').run(newHeader, ino)
+      headerBlob = newHeader
+    }
+
+    const parsed = parseFileHeader(headerBlob)
+    if (!this.cryptoSalt) {
+      throw this.createError('EIO', 'No filesystem salt available for chunk decryption')
+    }
+    if (!parsed.salt.equals(this.cryptoSalt)) {
+      throw this.createError(
+        'EIO',
+        `Header salt mismatch for inode ${ino}; unsupported database format`,
+      )
+    }
+
+    const context: FileCryptoContext = {
+      fileId: Buffer.from(parsed.fileId),
+    }
+    this.fileCryptoCache.set(ino, context)
+    return context
+  }
+
+  private resetFileCryptoContext(ino: number): void {
+    const existing = this.fileCryptoCache.get(ino)
+    if (!existing) return
+    existing.fileId.fill(0)
+    this.fileCryptoCache.delete(ino)
+  }
+
+  private encryptChunk(plaintext: Buffer, chunkIndex: number, context: FileCryptoContext): { meta: Buffer; data: Buffer } {
+    const key = this.requireMasterKey()
+    const nonce = Buffer.from(randomBytes(CHUNK_NONCE_SIZE))
+    const aad = buildChunkAad(context.fileId, chunkIndex)
+    const encrypted = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt_detached(
+      plaintext,
+      aad,
+      null,
+      nonce,
+      key,
+    )
+    return {
+      meta: buildChunkMeta(nonce, Buffer.from(encrypted.mac)),
+      data: Buffer.from(encrypted.ciphertext),
+    }
+  }
+
+  private decryptChunk(
+    ciphertext: Uint8Array,
+    meta: Uint8Array,
+    chunkIndex: number,
+    context: FileCryptoContext,
+  ): Buffer {
+    const key = this.requireMasterKey()
+    const parsed = parseChunkMeta(meta)
+    const aad = buildChunkAad(context.fileId, chunkIndex)
+    const plaintext = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt_detached(
+      null,
+      ciphertext,
+      parsed.tag,
+      aad,
+      parsed.nonce,
+      key,
+    )
+    return Buffer.from(plaintext)
   }
 
   private normalizePath(p: string): string {
@@ -373,12 +800,14 @@ export class CryptograftAFS extends BaseFilesystem {
 
   private createInode(mode: number): number {
     const now = nowSec()
+    const header =
+      this.masterKey && this.isFileMode(mode) ? this.newFileHeaderBlob() : null
     const result = this.db
       .query(`
         INSERT INTO fs_inode (mode, nlink, uid, gid, size, atime, mtime, ctime, rdev, chunk_size, header)
-        VALUES (?, 0, 0, 0, 0, ?, ?, ?, 0, ?, NULL)
+        VALUES (?, 0, 0, 0, 0, ?, ?, ?, 0, ?, ?)
       `)
-      .run(mode, now, now, now, this.chunkSize)
+      .run(mode, now, now, now, this.chunkSize, header)
 
     const ino = Number(result.lastInsertRowid)
     if (this.isFileMode(mode)) {
@@ -410,6 +839,7 @@ export class CryptograftAFS extends BaseFilesystem {
 
     if (this.isFileMode(row.mode)) {
       this.dropChunkTable(ino)
+      this.resetFileCryptoContext(ino)
     }
     this.db.query('DELETE FROM fs_symlink WHERE ino = ?').run(ino)
     this.db.query('DELETE FROM fs_inode WHERE ino = ?').run(ino)
@@ -466,6 +896,12 @@ export class CryptograftAFS extends BaseFilesystem {
       if (truncate && this.isFileMode(inode.mode)) {
         this.ensureChunkTable(ino)
         this.db.query(`DELETE FROM ${chunkTableName(ino)}`).run()
+        if (this.masterKey) {
+          this.resetFileCryptoContext(ino)
+          this.db
+            .query('UPDATE fs_inode SET header = ? WHERE ino = ?')
+            .run(this.newFileHeaderBlob(), ino)
+        }
         const now = nowSec()
         this.db
           .query('UPDATE fs_inode SET size = 0, mtime = ?, ctime = ? WHERE ino = ?')
@@ -538,8 +974,9 @@ export class CryptograftAFS extends BaseFilesystem {
     )
     let copied = 0
 
+    const cryptoContext = this.loadFileCryptoContext(file.ino, false)
     const selectStmt = this.db.query(
-      `SELECT data FROM ${table} WHERE chunk_index = ?`,
+      `SELECT meta, data FROM ${table} WHERE chunk_index = ?`,
     )
 
     while (copied < toRead) {
@@ -548,9 +985,28 @@ export class CryptograftAFS extends BaseFilesystem {
       const offsetInChunk = absolute % chunkSize
       const take = Math.min(toRead - copied, chunkSize - offsetInChunk)
 
-      const row = selectStmt.get(chunkIndex) as { data: Uint8Array } | undefined
+      const row = selectStmt.get(chunkIndex) as
+        | { meta: Uint8Array | null; data: Uint8Array }
+        | undefined
       if (row?.data) {
-        const chunk = Buffer.from(row.data)
+        let chunk: Buffer
+        if (row.meta) {
+          if (!cryptoContext) {
+            throw this.createError(
+              'EIO',
+              `Encrypted chunk found without passphrase for '${file.path}'`,
+            )
+          }
+          try {
+            chunk = Buffer.from(
+              this.decryptChunk(row.data, row.meta, chunkIndex, cryptoContext),
+            )
+          } catch (cause) {
+            throw this.createError('EIO', `Chunk authentication failed for '${file.path}'`, cause)
+          }
+        } else {
+          chunk = Buffer.from(row.data)
+        }
         if (offsetInChunk < chunk.length) {
           const available = Math.min(take, chunk.length - offsetInChunk)
           chunk.copy(out, offset + copied, offsetInChunk, offsetInChunk + available)
@@ -607,13 +1063,16 @@ export class CryptograftAFS extends BaseFilesystem {
 
     this.db.exec('BEGIN')
     try {
+      const cryptoContext = this.loadFileCryptoContext(file.ino, true)
       const selectStmt = this.db.query(
-        `SELECT data FROM ${table} WHERE chunk_index = ?`,
+        `SELECT meta, data FROM ${table} WHERE chunk_index = ?`,
       )
       const upsertStmt = this.db.query(`
         INSERT INTO ${table} (chunk_index, meta, data)
-        VALUES (?, NULL, ?)
-        ON CONFLICT(chunk_index) DO UPDATE SET data = excluded.data
+        VALUES (?, ?, ?)
+        ON CONFLICT(chunk_index) DO UPDATE SET
+          meta = excluded.meta,
+          data = excluded.data
       `)
 
       while (written < length) {
@@ -622,8 +1081,30 @@ export class CryptograftAFS extends BaseFilesystem {
         const offsetInChunk = absolute % chunkSize
         const take = Math.min(length - written, chunkSize - offsetInChunk)
 
-        const existing = selectStmt.get(chunkIndex) as { data: Uint8Array } | undefined
-        const existingBuf = existing?.data ? Buffer.from(existing.data) : Buffer.alloc(0)
+        const existing = selectStmt.get(chunkIndex) as
+          | { meta: Uint8Array | null; data: Uint8Array }
+          | undefined
+
+        let existingBuf = Buffer.alloc(0)
+        if (existing?.data) {
+          if (existing.meta) {
+            if (!cryptoContext) {
+              throw this.createError(
+                'EIO',
+                `Encrypted chunk found without passphrase for '${file.path}'`,
+              )
+            }
+            try {
+              existingBuf = Buffer.from(
+                this.decryptChunk(existing.data, existing.meta, chunkIndex, cryptoContext),
+              )
+            } catch (cause) {
+              throw this.createError('EIO', `Chunk authentication failed for '${file.path}'`, cause)
+            }
+          } else {
+            existingBuf = Buffer.from(existing.data)
+          }
+        }
 
         const needed = offsetInChunk + take
         const chunk = Buffer.alloc(Math.max(existingBuf.length, needed))
@@ -632,7 +1113,13 @@ export class CryptograftAFS extends BaseFilesystem {
         }
 
         src.copy(chunk, offsetInChunk, offset + written, offset + written + take)
-        upsertStmt.run(chunkIndex, chunk)
+
+        if (cryptoContext) {
+          const encrypted = this.encryptChunk(chunk, chunkIndex, cryptoContext)
+          upsertStmt.run(chunkIndex, encrypted.meta, encrypted.data)
+        } else {
+          upsertStmt.run(chunkIndex, null, chunk)
+        }
         written += take
       }
 
@@ -916,6 +1403,7 @@ export class CryptograftAFS extends BaseFilesystem {
 
     this.db.exec('BEGIN')
     try {
+      const cryptoContext = this.loadFileCryptoContext(ino, false)
       if (len === 0) {
         this.db.query(`DELETE FROM ${table}`).run()
       } else if (len < inode.size) {
@@ -927,13 +1415,41 @@ export class CryptograftAFS extends BaseFilesystem {
         const keep = len % chunkSize
         if (keep > 0) {
           const row = this.db
-            .query(`SELECT data FROM ${table} WHERE chunk_index = ?`)
-            .get(lastChunk) as { data: Uint8Array } | undefined
+            .query(`SELECT meta, data FROM ${table} WHERE chunk_index = ?`)
+            .get(lastChunk) as
+              | { meta: Uint8Array | null; data: Uint8Array }
+              | undefined
           if (row?.data) {
-            const truncated = Buffer.from(row.data).subarray(0, keep)
-            this.db
-              .query(`UPDATE ${table} SET data = ? WHERE chunk_index = ?`)
-              .run(truncated, lastChunk)
+            let chunk: Buffer
+            if (row.meta) {
+              if (!cryptoContext) {
+                throw this.createError(
+                  'EIO',
+                  `Encrypted chunk found without passphrase for '${normalized}'`,
+                )
+              }
+              try {
+                chunk = Buffer.from(
+                  this.decryptChunk(row.data, row.meta, lastChunk, cryptoContext),
+                )
+              } catch (cause) {
+                throw this.createError('EIO', `Chunk authentication failed for '${normalized}'`, cause)
+              }
+            } else {
+              chunk = Buffer.from(row.data)
+            }
+
+            const truncated = chunk.subarray(0, keep)
+            if (cryptoContext) {
+              const encrypted = this.encryptChunk(truncated, lastChunk, cryptoContext)
+              this.db
+                .query(`UPDATE ${table} SET meta = ?, data = ? WHERE chunk_index = ?`)
+                .run(encrypted.meta, encrypted.data, lastChunk)
+            } else {
+              this.db
+                .query(`UPDATE ${table} SET meta = NULL, data = ? WHERE chunk_index = ?`)
+                .run(truncated, lastChunk)
+            }
           }
         }
       }

@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-DEFAULT_SQLITE3MC_DIR="${PROJECT_DIR}/../../../../../github.com/utelle/SQLite3MultipleCiphers/v/2"
+DEFAULT_SQLITE3MC_DIR="${PROJECT_DIR}/../../../../../../modules/github.com/utelle/SQLite3MultipleCiphers/v/2"
 SQLITE3MC_DIR="${SQLITE3MC_DIR:-$DEFAULT_SQLITE3MC_DIR}"
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-${PROJECT_DIR}/artifacts}"
 

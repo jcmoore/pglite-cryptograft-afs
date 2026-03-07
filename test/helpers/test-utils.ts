@@ -1,6 +1,7 @@
 import {
   EncryptedFS,
   CryptograftAFS,
+  type CryptograftAFSOptions,
   deriveKeys,
   SALT_SIZE,
   type DerivedKeys,
@@ -68,8 +69,10 @@ export function createPassphraseFS(
  */
 export function createCryptograftAFS(
   dataDir: string,
+  options: CryptograftAFSOptions = {},
+  passphrase = 'test-passphrase',
 ): CryptograftAFS {
-  return new CryptograftAFS(dataDir)
+  return new CryptograftAFS(dataDir, passphrase, options)
 }
 
 /**
@@ -90,8 +93,10 @@ export async function createPassphrasePGlite(
 export async function createCryptograftPGlite(
   dataDir: string,
   extensions?: Record<string, unknown>,
+  fsOptions: CryptograftAFSOptions = {},
+  passphrase = 'test-passphrase',
 ): Promise<{ db: PGlite; fs: CryptograftAFS }> {
-  const cgfs = createCryptograftAFS(dataDir)
+  const cgfs = createCryptograftAFS(dataDir, fsOptions, passphrase)
   const db = await PGlite.create({ dataDir, fs: cgfs, extensions })
   return { db, fs: cgfs }
 }
@@ -102,8 +107,10 @@ export async function createCryptograftPGlite(
 export async function reopenCryptograftPGlite(
   dataDir: string,
   extensions?: Record<string, unknown>,
+  fsOptions: CryptograftAFSOptions = {},
+  passphrase = 'test-passphrase',
 ): Promise<{ db: PGlite; fs: CryptograftAFS }> {
-  const cgfs = createCryptograftAFS(dataDir)
+  const cgfs = createCryptograftAFS(dataDir, fsOptions, passphrase)
   const db = await PGlite.create({ dataDir, fs: cgfs, extensions })
   return { db, fs: cgfs }
 }

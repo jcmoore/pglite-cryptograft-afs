@@ -34,7 +34,7 @@ describe('fresh init', () => {
       const dir = createTestDir()
       const { db, fs } = await createCryptograftPGlite(dir)
       await db.close()
-      await fs.closeFs()
+      await fs.destroy()
     },
     { iterations: 3, warmupIterations: 1, time: 0 },
   )
@@ -81,11 +81,11 @@ describe('reopen', () => {
         cgDir = createTestDir()
         const { db, fs } = await createCryptograftPGlite(cgDir)
         await db.close()
-        await fs.closeFs()
+        await fs.destroy()
       }
       const { db, fs } = await createCryptograftPGlite(cgDir)
       await db.close()
-      await fs.closeFs()
+      await fs.destroy()
     },
     { iterations: 3, warmupIterations: 1, time: 0 },
   )

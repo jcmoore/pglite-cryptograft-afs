@@ -1,4 +1,5 @@
 import { PGlite } from '@electric-sql/pglite'
+import type { CryptograftAFSOptions } from '../../src/index.js'
 import {
   createTestDir,
   cleanupTestDir,
@@ -75,6 +76,7 @@ export async function createBenchPair(
 export async function createBenchTriple(
   schema: string,
   extensions?: Record<string, unknown>,
+  cgFsOptions: CryptograftAFSOptions = {},
 ): Promise<BenchTriple> {
   const plainDir = createTestDir()
   const encDir = createTestDir()
@@ -90,7 +92,11 @@ export async function createBenchTriple(
     'bench-passphrase',
     extensions,
   )
-  const { db: cgDb, fs: cgFs } = await createCryptograftPGlite(cgDir, extensions)
+  const { db: cgDb, fs: cgFs } = await createCryptograftPGlite(
+    cgDir,
+    extensions,
+    cgFsOptions,
+  )
 
   if (schema) {
     await plainDb.exec(schema)
@@ -102,7 +108,7 @@ export async function createBenchTriple(
     await plainDb.close()
     await encDb.close()
     await cgDb.close()
-    await cgFs.closeFs()
+    await cgFs.destroy()
     cleanupTestDir(plainDir)
     cleanupTestDir(encDir)
     cleanupTestDir(cgDir)

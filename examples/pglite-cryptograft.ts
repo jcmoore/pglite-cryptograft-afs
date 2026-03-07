@@ -126,7 +126,7 @@ async function main(): Promise<void> {
       pragmas: [`graft_switch = '${firstVolumeId}:${firstLocalLogId}:${remoteLogId}'`],
     })
 
-    fs1 = new CryptograftAFS(pgliteOneDataDir, {
+    fs1 = new CryptograftAFS(pgliteOneDataDir, sqliteKey, {
       pragmas: [
         `PRAGMA cipher = '${sqlQuote(sqliteCipher)}'`,
         `PRAGMA key = '${sqlQuote(sqliteKey)}'`,
@@ -149,7 +149,7 @@ async function main(): Promise<void> {
 
     await pg1.close()
     pg1 = null
-    await fs1.closeFs()
+    await fs1.destroy()
     fs1 = null
 
     const [pushText] = runControlPragmas({
@@ -172,7 +172,7 @@ async function main(): Promise<void> {
       ],
     })
 
-    fs2 = new CryptograftAFS(pgliteTwoDataDir, {
+    fs2 = new CryptograftAFS(pgliteTwoDataDir, sqliteKey, {
       pragmas: [
         `PRAGMA cipher = '${sqlQuote(sqliteCipher)}'`,
         `PRAGMA key = '${sqlQuote(sqliteKey)}'`,
@@ -203,9 +203,9 @@ async function main(): Promise<void> {
     console.log('pglite-cryptograft example: sync verified')
   } finally {
     if (pg2) await pg2.close()
-    if (fs2) await fs2.closeFs()
+    if (fs2) await fs2.destroy()
     if (pg1) await pg1.close()
-    if (fs1) await fs1.closeFs()
+    if (fs1) await fs1.destroy()
     rmSync(tempRoot, { recursive: true, force: true })
   }
 }

@@ -60,7 +60,7 @@ describe('CryptograftAFS', () => {
     fs1.write(fd1, data, 0, data.length, 0)
     fs1.close(fd1)
 
-    void fs1.closeFs()
+    void fs1.destroy()
 
     const fs2 = createCryptograftAFS(testDir)
     const fd2 = fs2.open('/persist.txt', 'r')
@@ -88,15 +88,27 @@ describe('CryptograftAFS', () => {
     expect(() => fs.open('/b.txt', 'r')).toThrow()
   })
 
-  it('initializes metadata sqlite with 64KB page size', async () => {
+  it('initializes metadata sqlite with 4KB page size', async () => {
     const fs = createCryptograftAFS(testDir)
-    await fs.closeFs()
+    await fs.destroy()
 
     const dbPath = path.join(testDir, '.cryptograft-fs.sqlite')
     const db = new BunDatabase(dbPath)
     const row = db.query('PRAGMA page_size').get() as { page_size: number }
     db.close()
 
-    expect(row.page_size).toBe(65536)
+    expect(row.page_size).toBe(4096)
+  })
+
+  it('supports explicit metadata sqlite page size override', async () => {
+    const fs = createCryptograftAFS(testDir, { sqlitePageSize: 8192 })
+    await fs.destroy()
+
+    const dbPath = path.join(testDir, '.cryptograft-fs.sqlite')
+    const db = new BunDatabase(dbPath)
+    const row = db.query('PRAGMA page_size').get() as { page_size: number }
+    db.close()
+
+    expect(row.page_size).toBe(8192)
   })
 })

@@ -26,9 +26,14 @@
     "test:watch": "bun --bun ./node_modules/vitest/vitest.mjs",
     "build:sqlite3mc": "bash ./scripts/build-sqlite3mc.sh",
     "clean:sqlite3mc": "bash ./scripts/clean-sqlite3mc-artifacts.sh",
+    "clean:bench": "bash ./scripts/clean-bench-artifacts.sh",
     "test:sqlite3mc": "bash ./scripts/run-sqlite3mc-tests.sh",
+    "build:graft:variants": "bash ./scripts/build-graft-variants.sh",
     "bench": "bun --bun ./node_modules/vitest/vitest.mjs bench --config vitest.bench.config.ts",
-    "example:pglite-cryptograft": "SQLITE3MC_DYLIB=/tmp/libsqlite3mc.dylib GRAFT_EXT_DYLIB=../../../../../../modules/github.com/orbitinghail/graft/v/0/target/debug/libgraft_ext.dylib SQLITE3MC_CIPHER=xchacha20 SQLITE3MC_KEY=cryptograft-demo-key bun examples/pglite-cryptograft.ts",
+    "bench:matrix": "bash ./scripts/run-bench-matrix.sh",
+    "bench:matrix:md": "bash ./scripts/run-bench-matrix-markdown.sh",
+    "bench:matrix:raw": "bun --bun ./node_modules/vitest/vitest.mjs bench --config vitest.bench.config.ts bench/cryptograft-matrix.bench.ts",
+    "example:pglite-cryptograft": "bash ./scripts/run-example-pglite-cryptograft.sh",
     "prepublishOnly": "pnpm run typecheck && pnpm run lint && pnpm run build"
   },
   "keywords": [
@@ -70,5 +75,9 @@
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.56.0",
     "vitest": "^4.0.18"
+  },
+  "dependencies": {
+    "@types/libsodium-wrappers-sumo": "^0.7.8",
+    "libsodium-wrappers-sumo": "^0.8.2"
   }
 }

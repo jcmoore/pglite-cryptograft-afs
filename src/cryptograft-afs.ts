@@ -433,7 +433,7 @@ export class CryptograftAFS extends BaseFilesystem {
   private readonly chunkSize: number
   private readonly sqlitePageSize: number
   private cryptoSalt: Buffer
-  private masterKey: Buffer
+  private keys : { encKey: Buffer }
   private readonly fileCryptoCache = new Map<number, FileCryptoContext>()
   private openFiles: Map<number, OpenFile> = new Map()
   private cwd = '/'
@@ -481,13 +481,15 @@ export class CryptograftAFS extends BaseFilesystem {
       throw this.createError('EIO', "Pre-initialized database is missing '.encryption-verify' token")
     }
 
-    this.masterKey = pbkdf2Sync(
-      passphrase,
-      this.cryptoSalt,
-      KDF_ITERATIONS,
-      sodium.crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
-      KDF_DIGEST,
-    )
+    this.keys = {
+      encKey: pbkdf2Sync(
+        passphrase,
+        this.cryptoSalt,
+        KDF_ITERATIONS,
+        sodium.crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
+        KDF_DIGEST,
+      )
+    }
 
     this.verifyOrCreateToken()
 
@@ -504,7 +506,7 @@ export class CryptograftAFS extends BaseFilesystem {
   destroy(): void {
     if (this.destroyed) return
 
-    this.masterKey.fill(0)
+    this.keys.encKey.fill(0)
     this.cryptoSalt.fill(0)
 
     for (const context of this.fileCryptoCache.values()) {
@@ -524,11 +526,6 @@ export class CryptograftAFS extends BaseFilesystem {
    * Throws immediately if the passphrase is wrong.
    */
   private verifyOrCreateToken(): void {
-    const cryptoSalt = this.cryptoSalt
-    if (!cryptoSalt) {
-      throw this.createError('EIO', 'No filesystem salt available for verification token')
-    }
-
     const row = this.db
       .query('SELECT header, meta, data FROM fs_verification WHERE name = ?')
       .get(VERIFICATION_TOKEN_NAME) as
@@ -545,7 +542,7 @@ export class CryptograftAFS extends BaseFilesystem {
       }
 
       const fileId = Buffer.from(randomBytes(CHUNK_HEADER_FILE_ID_SIZE))
-      const header = Buffer.concat([cryptoSalt, fileId])
+      const header = Buffer.concat([this.cryptoSalt, fileId])
       const nonce = Buffer.from(randomBytes(CHUNK_NONCE_SIZE))
       const aad = buildChunkAad(fileId, 0)
       const encrypted = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt_detached(
@@ -553,7 +550,7 @@ export class CryptograftAFS extends BaseFilesystem {
         aad,
         null,
         nonce,
-        this.masterKey,
+        this.keys.encKey,
       )
       const meta = buildChunkMeta(nonce, Buffer.from(encrypted.mac))
       const data = Buffer.from(encrypted.ciphertext)
@@ -564,7 +561,7 @@ export class CryptograftAFS extends BaseFilesystem {
     } else {
       try {
         const parsedHeader = parseFileHeader(row.header)
-        if (!parsedHeader.salt.equals(cryptoSalt)) {
+        if (!parsedHeader.salt.equals(this.cryptoSalt)) {
           throw new Error('Verification token salt mismatch')
         }
   
@@ -576,7 +573,7 @@ export class CryptograftAFS extends BaseFilesystem {
           parsedMeta.tag,
           aad,
           parsedMeta.nonce,
-          this.masterKey,
+          this.keys.encKey,
         )
   
         if (!Buffer.from(plaintext).equals(VERIFICATION_MAGIC)) {
@@ -610,27 +607,12 @@ export class CryptograftAFS extends BaseFilesystem {
     return this.graftPragma('graft_info')
   }
 
-  private requireMasterKey(): Buffer {
-    if (!this.masterKey) {
-      throw this.createError('EIO', 'No key material available for chunk encryption')
-    }
-    return this.masterKey
-  }
-
   private newFileHeaderBlob(): Buffer {
-    this.requireMasterKey()
-    if (!this.cryptoSalt) {
-      throw this.createError('EIO', 'No filesystem salt available for chunk encryption')
-    }
     const fileId = Buffer.from(randomBytes(CHUNK_HEADER_FILE_ID_SIZE))
     return Buffer.concat([this.cryptoSalt, fileId])
   }
 
   private loadFileCryptoContext(ino: number, createHeaderIfMissing: boolean): FileCryptoContext | null {
-    if (!this.masterKey) {
-      return null
-    }
-
     const cached = this.fileCryptoCache.get(ino)
     if (cached) {
       return cached
@@ -654,9 +636,6 @@ export class CryptograftAFS extends BaseFilesystem {
     }
 
     const parsed = parseFileHeader(headerBlob)
-    if (!this.cryptoSalt) {
-      throw this.createError('EIO', 'No filesystem salt available for chunk decryption')
-    }
     if (!parsed.salt.equals(this.cryptoSalt)) {
       throw this.createError(
         'EIO',
@@ -679,7 +658,7 @@ export class CryptograftAFS extends BaseFilesystem {
   }
 
   private encryptChunk(plaintext: Buffer, chunkIndex: number, context: FileCryptoContext): { meta: Buffer; data: Buffer } {
-    const key = this.requireMasterKey()
+    const key = this.keys.encKey
     const nonce = Buffer.from(randomBytes(CHUNK_NONCE_SIZE))
     const aad = buildChunkAad(context.fileId, chunkIndex)
     const encrypted = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt_detached(
@@ -701,7 +680,7 @@ export class CryptograftAFS extends BaseFilesystem {
     chunkIndex: number,
     context: FileCryptoContext,
   ): Buffer {
-    const key = this.requireMasterKey()
+    const key = this.keys.encKey
     const parsed = parseChunkMeta(meta)
     const aad = buildChunkAad(context.fileId, chunkIndex)
     const plaintext = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt_detached(
@@ -800,8 +779,7 @@ export class CryptograftAFS extends BaseFilesystem {
 
   private createInode(mode: number): number {
     const now = nowSec()
-    const header =
-      this.masterKey && this.isFileMode(mode) ? this.newFileHeaderBlob() : null
+    const header = this.isFileMode(mode) ? this.newFileHeaderBlob() : null
     const result = this.db
       .query(`
         INSERT INTO fs_inode (mode, nlink, uid, gid, size, atime, mtime, ctime, rdev, chunk_size, header)
@@ -854,6 +832,10 @@ export class CryptograftAFS extends BaseFilesystem {
   }
 
   open(pathStr: string, flags: string | number = 'r', mode = 0o666): number {
+    if (this.destroyed) {
+      throw this.createError('EIO', 'filesystem has been destroyed')
+    }
+
     const normalized = this.normalizePath(pathStr)
     const nodeFlags = emFlagsToNode(flags)
 
@@ -896,12 +878,10 @@ export class CryptograftAFS extends BaseFilesystem {
       if (truncate && this.isFileMode(inode.mode)) {
         this.ensureChunkTable(ino)
         this.db.query(`DELETE FROM ${chunkTableName(ino)}`).run()
-        if (this.masterKey) {
-          this.resetFileCryptoContext(ino)
-          this.db
-            .query('UPDATE fs_inode SET header = ? WHERE ino = ?')
-            .run(this.newFileHeaderBlob(), ino)
-        }
+        this.resetFileCryptoContext(ino)
+        this.db
+          .query('UPDATE fs_inode SET header = ? WHERE ino = ?')
+          .run(this.newFileHeaderBlob(), ino)
         const now = nowSec()
         this.db
           .query('UPDATE fs_inode SET size = 0, mtime = ?, ctime = ? WHERE ino = ?')
@@ -948,6 +928,10 @@ export class CryptograftAFS extends BaseFilesystem {
     length: number,
     position: number | null,
   ): number {
+    if (this.destroyed) {
+      throw this.createError('EIO', 'filesystem has been destroyed')
+    }
+
     const file = this.getOpenFile(fd)
     if (file.isDir) {
       throw this.createError('EISDIR', 'read from directory')
@@ -1037,6 +1021,10 @@ export class CryptograftAFS extends BaseFilesystem {
     length: number,
     position: number | null,
   ): number {
+    if (this.destroyed) {
+      throw this.createError('EIO', 'filesystem has been destroyed')
+    }
+
     const file = this.getOpenFile(fd)
     if (file.isDir) {
       throw this.createError('EISDIR', 'write to directory')
@@ -1178,6 +1166,10 @@ export class CryptograftAFS extends BaseFilesystem {
   }
 
   mkdir(pathStr: string, options?: { recursive?: boolean; mode?: number }): void {
+    if (this.destroyed) {
+      throw this.createError('EIO', 'filesystem has been destroyed')
+    }
+
     const normalized = this.normalizePath(pathStr)
     if (normalized === '/') return
 
@@ -1380,6 +1372,10 @@ export class CryptograftAFS extends BaseFilesystem {
   }
 
   truncate(pathStr: string, len: number): void {
+    if (this.destroyed) {
+      throw this.createError('EIO', 'filesystem has been destroyed')
+    }
+
     if (len < 0) {
       throw this.createError('EINVAL', `truncate '${pathStr}'`)
     }

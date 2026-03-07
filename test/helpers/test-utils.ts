@@ -1,11 +1,15 @@
 import {
   EncryptedFS,
-  CryptograftAFS,
+  CryptograftAFS as CryptograftAFSCurrent,
   type CryptograftAFSOptions,
   deriveKeys,
   SALT_SIZE,
   type DerivedKeys,
 } from '../../src/index.js'
+import {
+  CryptograftAFS as CryptograftAFSOld,
+  type CryptograftAFSOptions as CryptograftAFSOptionsOld,
+} from '../../src/cryptograft-old-afs.js'
 import { PGlite } from '@electric-sql/pglite'
 import { createHash } from 'node:crypto'
 import * as fs from 'fs'
@@ -71,15 +75,32 @@ export function createPassphraseFS(
 export function createCryptograftAFS(
   dataDir: string,
   options: CryptograftAFSOptions = {},
-  passphrase = 'test-passphrase',
-): CryptograftAFS {
+  passphrase: string | null = 'test-passphrase',
+): CryptograftAFSCurrent {
   const tagSuffix = createHash('sha1').update(dataDir).digest('hex').slice(0, 16)
   const defaultOptions: CryptograftAFSOptions = {
     graftRemoteType: 'fs',
     graftRemoteRoot: path.join(dataDir, '.cryptograft-graft', 'remote'),
     graftTag: `cryptograft-test.${tagSuffix}`,
   }
-  return new CryptograftAFS(dataDir, passphrase, { ...defaultOptions, ...options })
+  return new CryptograftAFSCurrent(dataDir, passphrase, { ...defaultOptions, ...options })
+}
+
+/**
+ * Create a legacy CryptograftAFS instance for benchmarking/comparison.
+ */
+export function createCryptograftOldAFS(
+  dataDir: string,
+  options: CryptograftAFSOptionsOld = {},
+  passphrase = 'test-passphrase',
+): CryptograftAFSOld {
+  const tagSuffix = createHash('sha1').update(dataDir).digest('hex').slice(0, 16)
+  const defaultOptions: CryptograftAFSOptionsOld = {
+    graftRemoteType: 'fs',
+    graftRemoteRoot: path.join(dataDir, '.cryptograft-graft', 'remote'),
+    graftTag: `cryptograft-old-test.${tagSuffix}`,
+  }
+  return new CryptograftAFSOld(dataDir, passphrase, { ...defaultOptions, ...options })
 }
 
 /**
@@ -101,9 +122,23 @@ export async function createCryptograftPGlite(
   dataDir: string,
   extensions?: Record<string, unknown>,
   fsOptions: CryptograftAFSOptions = {},
-  passphrase = 'test-passphrase',
-): Promise<{ db: PGlite; fs: CryptograftAFS }> {
+  passphrase: string | null = 'test-passphrase',
+): Promise<{ db: PGlite; fs: CryptograftAFSCurrent }> {
   const cgfs = createCryptograftAFS(dataDir, fsOptions, passphrase)
+  const db = await PGlite.create({ dataDir, fs: cgfs, extensions })
+  return { db, fs: cgfs }
+}
+
+/**
+ * Create a PGlite instance backed by legacy CryptograftAFS
+ */
+export async function createCryptograftOldPGlite(
+  dataDir: string,
+  extensions?: Record<string, unknown>,
+  fsOptions: CryptograftAFSOptionsOld = {},
+  passphrase = 'test-passphrase',
+): Promise<{ db: PGlite; fs: CryptograftAFSOld }> {
+  const cgfs = createCryptograftOldAFS(dataDir, fsOptions, passphrase)
   const db = await PGlite.create({ dataDir, fs: cgfs, extensions })
   return { db, fs: cgfs }
 }
@@ -115,8 +150,8 @@ export async function reopenCryptograftPGlite(
   dataDir: string,
   extensions?: Record<string, unknown>,
   fsOptions: CryptograftAFSOptions = {},
-  passphrase = 'test-passphrase',
-): Promise<{ db: PGlite; fs: CryptograftAFS }> {
+  passphrase: string | null = 'test-passphrase',
+): Promise<{ db: PGlite; fs: CryptograftAFSCurrent }> {
   const cgfs = createCryptograftAFS(dataDir, fsOptions, passphrase)
   const db = await PGlite.create({ dataDir, fs: cgfs, extensions })
   return { db, fs: cgfs }

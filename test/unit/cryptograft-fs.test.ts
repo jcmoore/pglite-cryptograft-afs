@@ -52,14 +52,15 @@ describe('CryptograftAFS', () => {
     expect(Array.from(out.slice(8192, 8196))).toEqual([1, 2, 3, 4])
   })
 
-  it('persists data across filesystem instances', () => {
+  it('persists data across filesystem instances after syncToFs', async () => {
     const fs1 = createCryptograftAFS(testDir)
     const fd1 = fs1.open('/persist.txt', 'w')
     const data = Buffer.from('persist me')
     fs1.write(fd1, data, 0, data.length, 0)
     fs1.close(fd1)
 
-    void fs1.destroy()
+    await fs1.syncToFs()
+    fs1.destroy()
 
     const fs2 = createCryptograftAFS(testDir)
     const fd2 = fs2.open('/persist.txt', 'r')
@@ -69,6 +70,18 @@ describe('CryptograftAFS', () => {
 
     expect(n).toBe(data.length)
     expect(Buffer.from(out).toString()).toBe('persist me')
+  })
+
+  it('rolls back pending writes on destroy without syncToFs', () => {
+    const fs1 = createCryptograftAFS(testDir)
+    const fd1 = fs1.open('/transient.txt', 'w')
+    const data = Buffer.from('do not persist')
+    fs1.write(fd1, data, 0, data.length, 0)
+    fs1.close(fd1)
+    fs1.destroy()
+
+    const fs2 = createCryptograftAFS(testDir)
+    expect(() => fs2.open('/transient.txt', 'r')).toThrow()
   })
 
   it('renames and unlinks files correctly', () => {

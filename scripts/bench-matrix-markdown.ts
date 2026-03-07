@@ -36,7 +36,7 @@ interface Row {
 }
 
 function parsePageKb(fileName: string): number {
-  const match = /page(\d+)k\.json$/i.exec(fileName)
+  const match = /page(\d+)k/i.exec(fileName)
   if (!match) {
     throw new Error(`Could not infer page size from filename: ${fileName}`)
   }

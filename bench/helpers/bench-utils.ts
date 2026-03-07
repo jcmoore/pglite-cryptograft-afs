@@ -5,6 +5,7 @@ import {
   cleanupTestDir,
   createEncryptedPGlite,
   createCryptograftPGlite,
+  createCryptograftOldPGlite,
 } from '../../test/helpers/test-utils.js'
 
 export {
@@ -12,6 +13,7 @@ export {
   cleanupTestDir,
   createEncryptedPGlite,
   createCryptograftPGlite,
+  createCryptograftOldPGlite,
 }
 
 export interface BenchPair {

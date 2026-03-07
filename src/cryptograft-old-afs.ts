@@ -32,7 +32,6 @@ const KDF_ITERATIONS = 256000
 const KDF_DIGEST = 'sha512'
 const VERIFICATION_TOKEN_NAME = '.encryption-verify'
 const VERIFICATION_MAGIC = Buffer.from('CRYPTOGRAFT_VERIFY_V1')
-const ROOT_SYNC_SAVEPOINT = 'cryptograft_afs_sync'
 
 const O_WRONLY = 1
 const O_RDWR = 2
@@ -441,27 +440,22 @@ export class CryptograftAFS extends BaseFilesystem {
   private readonly db: BunDatabase
   private readonly chunkSize: number
   private readonly sqlitePageSize: number
-  private readonly encryptionEnabled: boolean
   private cryptoSalt: Buffer
   private keys : { encKey: Buffer }
   private readonly fileCryptoCache = new Map<number, FileCryptoContext>()
   private openFiles: Map<number, OpenFile> = new Map()
   private cwd = '/'
   private nextFd = 100
-  private rootSavepointOpen = false
-  private dirtySinceSync = false
-  private mutationSavepointCounter = 0
 
   private destroyed = false
 
-  constructor(dataDir: string, passphrase: string | null, options: CryptograftAFSOptions = {}, db?: BunDatabase) {
+  constructor(dataDir: string, passphrase: string, options: CryptograftAFSOptions = {}, db?: BunDatabase) {
     super(dataDir, options.debug === undefined ? {} : { debug: options.debug })
 
     const baseDir = this.dataDir ?? dataDir
     this.chunkSize = options.chunkSize ?? DEFAULT_CHUNK_SIZE
     this.sqlitePageSize = resolveSqlitePageSize(options.sqlitePageSize)
     this.ownsDB = !db;
-    this.encryptionEnabled = passphrase !== null
 
     if (db) {
       const hasVerificationTable = db
@@ -487,32 +481,26 @@ export class CryptograftAFS extends BaseFilesystem {
       .query('SELECT header FROM fs_verification WHERE name = ?')
       .get(VERIFICATION_TOKEN_NAME) as { header: Uint8Array } | undefined
 
-    if (!this.encryptionEnabled || passphrase === null) {
-      this.cryptoSalt = Buffer.alloc(0)
-      this.keys = { encKey: Buffer.alloc(0) }
+    if (existingVerificationHeader) {
+      const parsedHeader = parseFileHeader(existingVerificationHeader.header)
+      this.cryptoSalt = Buffer.from(parsedHeader.salt)
+    } else if (!db) {
+      this.cryptoSalt = Buffer.from(randomBytes(CHUNK_HEADER_SALT_SIZE))
     } else {
-      if (existingVerificationHeader) {
-        const parsedHeader = parseFileHeader(existingVerificationHeader.header)
-        this.cryptoSalt = Buffer.from(parsedHeader.salt)
-      } else if (!db) {
-        this.cryptoSalt = Buffer.from(randomBytes(CHUNK_HEADER_SALT_SIZE))
-      } else {
-        throw this.createError('EIO', "Pre-initialized database is missing '.encryption-verify' token")
-      }
-
-      this.keys = {
-        encKey: pbkdf2Sync(
-          passphrase,
-          this.cryptoSalt,
-          KDF_ITERATIONS,
-          sodium.crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
-          KDF_DIGEST,
-        )
-      }
-
-      this.verifyOrCreateToken()
+      throw this.createError('EIO', "Pre-initialized database is missing '.encryption-verify' token")
     }
-    this.startRootSavepoint()
+
+    this.keys = {
+      encKey: pbkdf2Sync(
+        passphrase,
+        this.cryptoSalt,
+        KDF_ITERATIONS,
+        sodium.crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
+        KDF_DIGEST,
+      )
+    }
+
+    this.verifyOrCreateToken()
 
     if (this.debug) {
       console.log('CryptograftAFS initialized with dataDir:', baseDir)
@@ -527,20 +515,6 @@ export class CryptograftAFS extends BaseFilesystem {
   destroy(): void {
     if (this.destroyed) return
 
-    if (this.rootSavepointOpen) {
-      try {
-        this.db.exec(`ROLLBACK TO SAVEPOINT ${ROOT_SYNC_SAVEPOINT}`)
-      } finally {
-        this.db.exec(`RELEASE SAVEPOINT ${ROOT_SYNC_SAVEPOINT}`)
-      }
-      this.rootSavepointOpen = false
-      this.dirtySinceSync = false
-    }
-
-    if (this.ownsDB) {
-      this.db.close()
-    }
-
     this.keys.encKey.fill(0)
     this.cryptoSalt.fill(0)
 
@@ -550,24 +524,11 @@ export class CryptograftAFS extends BaseFilesystem {
 
     this.fileCryptoCache.clear()
 
-    this.destroyed = true
-  }
-
-  override async syncToFs(_relaxedDurability?: boolean): Promise<void> {
-    if (this.destroyed || !this.rootSavepointOpen || !this.dirtySinceSync) {
-      return
+    if (this.ownsDB) {
+      this.db.close()
     }
 
-    this.db.exec(`RELEASE SAVEPOINT ${ROOT_SYNC_SAVEPOINT}`)
-    this.rootSavepointOpen = false
-    this.startRootSavepoint()
-    this.dirtySinceSync = false
-  }
-
-  override async closeFs(): Promise<void> {
-    if (this.destroyed) return
-    await this.syncToFs()
-    this.destroy()
+    this.destroyed = true
   }
 
   /**
@@ -576,10 +537,6 @@ export class CryptograftAFS extends BaseFilesystem {
    * Throws immediately if the passphrase is wrong.
    */
   private verifyOrCreateToken(): void {
-    if (!this.encryptionEnabled) {
-      return
-    }
-
     const row = this.db
       .query('SELECT header, meta, data FROM fs_verification WHERE name = ?')
       .get(VERIFICATION_TOKEN_NAME) as
@@ -648,18 +605,11 @@ export class CryptograftAFS extends BaseFilesystem {
   }
 
   private newFileHeaderBlob(): Buffer {
-    if (!this.encryptionEnabled) {
-      throw this.createError('EIO', 'encryption not available')
-    }
     const fileId = Buffer.from(randomBytes(CHUNK_HEADER_FILE_ID_SIZE))
     return Buffer.concat([this.cryptoSalt, fileId])
   }
 
   private loadFileCryptoContext(ino: number, createHeaderIfMissing: boolean): FileCryptoContext | null {
-    if (!this.encryptionEnabled) {
-      return null
-    }
-
     const cached = this.fileCryptoCache.get(ino)
     if (cached) {
       return cached
@@ -705,9 +655,6 @@ export class CryptograftAFS extends BaseFilesystem {
   }
 
   private encryptChunk(plaintext: Buffer, chunkIndex: number, context: FileCryptoContext): { meta: Buffer; data: Buffer } {
-    if (!this.encryptionEnabled) {
-      throw this.createError('EIO', 'encryption not available')
-    }
     const key = this.keys.encKey
     const nonce = Buffer.from(randomBytes(CHUNK_NONCE_SIZE))
     const aad = buildChunkAad(context.fileId, chunkIndex)
@@ -730,9 +677,6 @@ export class CryptograftAFS extends BaseFilesystem {
     chunkIndex: number,
     context: FileCryptoContext,
   ): Buffer {
-    if (!this.encryptionEnabled) {
-      throw this.createError('EIO', 'encryption not available')
-    }
     const key = this.keys.encKey
     const parsed = parseChunkMeta(meta)
     const aad = buildChunkAad(context.fileId, chunkIndex)
@@ -832,10 +776,7 @@ export class CryptograftAFS extends BaseFilesystem {
 
   private createInode(mode: number): number {
     const now = nowSec()
-    const header =
-      this.encryptionEnabled && this.isFileMode(mode)
-        ? this.newFileHeaderBlob()
-        : null
+    const header = this.isFileMode(mode) ? this.newFileHeaderBlob() : null
     const result = this.db
       .query(`
         INSERT INTO fs_inode (mode, nlink, uid, gid, size, atime, mtime, ctime, rdev, chunk_size, header)
@@ -879,32 +820,6 @@ export class CryptograftAFS extends BaseFilesystem {
     this.db.query('DELETE FROM fs_inode WHERE ino = ?').run(ino)
   }
 
-  private startRootSavepoint(): void {
-    if (this.rootSavepointOpen) return
-    this.db.exec(`SAVEPOINT ${ROOT_SYNC_SAVEPOINT}`)
-    this.rootSavepointOpen = true
-  }
-
-  private withMutationSavepoint<T>(label: string, fn: () => T): T {
-    const safeLabel = label.replace(/[^a-zA-Z0-9_]/g, '_')
-    const savepointName = `cryptograft_afs_${safeLabel}_${++this.mutationSavepointCounter}`
-
-    this.db.exec(`SAVEPOINT ${savepointName}`)
-    try {
-      const result = fn()
-      this.db.exec(`RELEASE SAVEPOINT ${savepointName}`)
-      this.dirtySinceSync = true
-      return result
-    } catch (e) {
-      try {
-        this.db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`)
-      } finally {
-        this.db.exec(`RELEASE SAVEPOINT ${savepointName}`)
-      }
-      throw e
-    }
-  }
-
   private getOpenFile(fd: number): OpenFile {
     const file = this.openFiles.get(fd)
     if (!file) {
@@ -933,22 +848,21 @@ export class CryptograftAFS extends BaseFilesystem {
     }
 
     let ino = existingIno
+
+    this.db.exec('BEGIN')
     try {
       if (ino === null) {
-        ino = this.withMutationSavepoint('open_create', () => {
-          const parent = this.resolveParent(normalized)
-          if (!parent) {
-            throw this.createError('ENOENT', `open '${normalized}'`)
-          }
-          const parentInode = this.getInode(parent.parentIno)
-          if (!parentInode || !this.isDirMode(parentInode.mode)) {
-            throw this.createError('ENOTDIR', `open '${normalized}'`)
-          }
+        const parent = this.resolveParent(normalized)
+        if (!parent) {
+          throw this.createError('ENOENT', `open '${normalized}'`)
+        }
+        const parentInode = this.getInode(parent.parentIno)
+        if (!parentInode || !this.isDirMode(parentInode.mode)) {
+          throw this.createError('ENOTDIR', `open '${normalized}'`)
+        }
 
-          const createdIno = this.createInode((mode & 0o777) | S_IFREG)
-          this.createDentry(parent.parentIno, parent.name, createdIno)
-          return createdIno
-        })
+        ino = this.createInode((mode & 0o777) | S_IFREG)
+        this.createDentry(parent.parentIno, parent.name, ino)
       } else if (exclusive && createIfMissing) {
         throw this.createError('EEXIST', `open '${normalized}'`)
       }
@@ -959,20 +873,19 @@ export class CryptograftAFS extends BaseFilesystem {
       }
 
       if (truncate && this.isFileMode(inode.mode)) {
-        const truncateIno = ino
-        this.withMutationSavepoint('open_truncate', () => {
-          this.ensureChunkTable(truncateIno)
-          this.db.query(`DELETE FROM ${chunkTableName(truncateIno)}`).run()
-          this.resetFileCryptoContext(truncateIno)
-          this.db
-            .query('UPDATE fs_inode SET header = ? WHERE ino = ?')
-            .run(this.encryptionEnabled ? this.newFileHeaderBlob() : null, truncateIno)
-          const now = nowSec()
-          this.db
-            .query('UPDATE fs_inode SET size = 0, mtime = ?, ctime = ? WHERE ino = ?')
-            .run(now, now, truncateIno)
-        })
+        this.ensureChunkTable(ino)
+        this.db.query(`DELETE FROM ${chunkTableName(ino)}`).run()
+        this.resetFileCryptoContext(ino)
+        this.db
+          .query('UPDATE fs_inode SET header = ? WHERE ino = ?')
+          .run(this.newFileHeaderBlob(), ino)
+        const now = nowSec()
+        this.db
+          .query('UPDATE fs_inode SET size = 0, mtime = ?, ctime = ? WHERE ino = ?')
+          .run(now, now, ino)
       }
+
+      this.db.exec('COMMIT')
 
       const refreshed = this.getInode(ino)
       if (!refreshed) {
@@ -992,6 +905,7 @@ export class CryptograftAFS extends BaseFilesystem {
       })
       return fd
     } catch (e) {
+      this.db.exec('ROLLBACK')
       if (e instanceof Error && 'code' in e) {
         throw e
       }
@@ -1130,83 +1044,84 @@ export class CryptograftAFS extends BaseFilesystem {
     this.ensureChunkTable(file.ino)
 
     const src = Buffer.from(buffer)
+    let written = 0
+
+    this.db.exec('BEGIN')
     try {
-      const mutation = this.withMutationSavepoint('write', () => {
-        let written = 0
-        const cryptoContext = this.loadFileCryptoContext(file.ino, true)
-        const selectStmt = this.db.query(
-          `SELECT meta, data FROM ${table} WHERE chunk_index = ?`,
-        )
+      const cryptoContext = this.loadFileCryptoContext(file.ino, true)
+      const selectStmt = this.db.query(
+        `SELECT meta, data FROM ${table} WHERE chunk_index = ?`,
+      )
+      const upsertStmt = this.db.query(`
+        INSERT INTO ${table} (chunk_index, meta, data)
+        VALUES (?, ?, ?)
+        ON CONFLICT(chunk_index) DO UPDATE SET
+          meta = excluded.meta,
+          data = excluded.data
+      `)
 
-        while (written < length) {
-          const absolute = logicalPos + written
-          const chunkIndex = Math.floor(absolute / chunkSize)
-          const offsetInChunk = absolute % chunkSize
-          const take = Math.min(length - written, chunkSize - offsetInChunk)
+      while (written < length) {
+        const absolute = logicalPos + written
+        const chunkIndex = Math.floor(absolute / chunkSize)
+        const offsetInChunk = absolute % chunkSize
+        const take = Math.min(length - written, chunkSize - offsetInChunk)
 
-          const existing = selectStmt.get(chunkIndex) as
-            | { meta: Uint8Array | null; data: Uint8Array }
-            | undefined
+        const existing = selectStmt.get(chunkIndex) as
+          | { meta: Uint8Array | null; data: Uint8Array }
+          | undefined
 
-          let existingBuf = Buffer.alloc(0)
-          if (existing?.data) {
-            if (existing.meta) {
-              if (!cryptoContext) {
-                throw this.createError(
-                  'EIO',
-                  `Encrypted chunk found without passphrase for '${file.path}'`,
-                )
-              }
-              try {
-                existingBuf = Buffer.from(
-                  this.decryptChunk(existing.data, existing.meta, chunkIndex, cryptoContext),
-                )
-              } catch (cause) {
-                throw this.createError('EIO', `Chunk authentication failed for '${file.path}'`, cause)
-              }
-            } else {
-              existingBuf = Buffer.from(existing.data)
+        let existingBuf = Buffer.alloc(0)
+        if (existing?.data) {
+          if (existing.meta) {
+            if (!cryptoContext) {
+              throw this.createError(
+                'EIO',
+                `Encrypted chunk found without passphrase for '${file.path}'`,
+              )
             }
-          }
-
-          const needed = offsetInChunk + take
-          const chunk = Buffer.alloc(Math.max(existingBuf.length, needed))
-          if (existingBuf.length) {
-            existingBuf.copy(chunk)
-          }
-
-          src.copy(chunk, offsetInChunk, offset + written, offset + written + take)
-
-          const upsertStmt = this.db.query(`
-            INSERT INTO ${table} (chunk_index, meta, data)
-            VALUES (?, ?, ?)
-            ON CONFLICT(chunk_index) DO UPDATE SET
-              meta = excluded.meta,
-              data = excluded.data
-          `)
-
-          if (cryptoContext) {
-            const encrypted = this.encryptChunk(chunk, chunkIndex, cryptoContext)
-            upsertStmt.run(chunkIndex, encrypted.meta, encrypted.data)
+            try {
+              existingBuf = Buffer.from(
+                this.decryptChunk(existing.data, existing.meta, chunkIndex, cryptoContext),
+              )
+            } catch (cause) {
+              throw this.createError('EIO', `Chunk authentication failed for '${file.path}'`, cause)
+            }
           } else {
-            upsertStmt.run(chunkIndex, null, chunk)
+            existingBuf = Buffer.from(existing.data)
           }
-          written += take
         }
 
-        const newSize = Math.max(inode.size, logicalPos + written)
-        const now = nowSec()
-        this.db
-          .query('UPDATE fs_inode SET size = ?, mtime = ?, ctime = ? WHERE ino = ?')
-          .run(newSize, now, now, file.ino)
-        return { written, newSize }
-      })
+        const needed = offsetInChunk + take
+        const chunk = Buffer.alloc(Math.max(existingBuf.length, needed))
+        if (existingBuf.length) {
+          existingBuf.copy(chunk)
+        }
 
-      file.position = logicalPos + mutation.written
-      file.size = mutation.newSize
+        src.copy(chunk, offsetInChunk, offset + written, offset + written + take)
+
+        if (cryptoContext) {
+          const encrypted = this.encryptChunk(chunk, chunkIndex, cryptoContext)
+          upsertStmt.run(chunkIndex, encrypted.meta, encrypted.data)
+        } else {
+          upsertStmt.run(chunkIndex, null, chunk)
+        }
+        written += take
+      }
+
+      const newSize = Math.max(inode.size, logicalPos + written)
+      const now = nowSec()
+      this.db
+        .query('UPDATE fs_inode SET size = ?, mtime = ?, ctime = ? WHERE ino = ?')
+        .run(newSize, now, now, file.ino)
+
+      this.db.exec('COMMIT')
+
+      file.position = logicalPos + written
+      file.size = newSize
       file.chunkSize = chunkSize
-      return mutation.written
+      return written
     } catch (e) {
+      this.db.exec('ROLLBACK')
       throw this.createError('EIO', `write '${file.path}'`, e)
     }
   }
@@ -1222,9 +1137,7 @@ export class CryptograftAFS extends BaseFilesystem {
       throw this.createError('ENOENT', `chmod '${normalized}'`)
     }
     const newMode = (inode.mode & S_IFMT) | (mode & 0o777)
-    this.withMutationSavepoint('chmod', () => {
-      this.db.query('UPDATE fs_inode SET mode = ? WHERE ino = ?').run(newMode, ino)
-    })
+    this.db.query('UPDATE fs_inode SET mode = ? WHERE ino = ?').run(newMode, ino)
   }
 
   fstat(fd: number): FsStats {
@@ -1276,18 +1189,15 @@ export class CryptograftAFS extends BaseFilesystem {
           continue
         }
 
+        this.db.exec('BEGIN')
         try {
-          const ino = this.withMutationSavepoint('mkdir_recursive', () => {
-            const created = this.createInode(mode)
-            this.createDentry(current, part, created)
-            return created
-          })
+          const ino = this.createInode(mode)
+          this.createDentry(current, part, ino)
+          this.db.exec('COMMIT')
           current = ino
         } catch (e) {
-          if (e instanceof Error && 'code' in e) {
-            throw e
-          }
-          throw this.createError('EIO', `mkdir '${normalized}'`, e)
+          this.db.exec('ROLLBACK')
+          throw e
         }
       }
       return
@@ -1306,12 +1216,13 @@ export class CryptograftAFS extends BaseFilesystem {
       throw this.createError('ENOTDIR', `mkdir '${normalized}'`)
     }
 
+    this.db.exec('BEGIN')
     try {
-      this.withMutationSavepoint('mkdir', () => {
-        const ino = this.createInode(mode)
-        this.createDentry(parent.parentIno, parent.name, ino)
-      })
+      const ino = this.createInode(mode)
+      this.createDentry(parent.parentIno, parent.name, ino)
+      this.db.exec('COMMIT')
     } catch (e) {
+      this.db.exec('ROLLBACK')
       throw this.createError('EIO', `mkdir '${normalized}'`, e)
     }
   }
@@ -1367,50 +1278,51 @@ export class CryptograftAFS extends BaseFilesystem {
       throw this.createError('ENOTDIR', `rename '${newNormalized}'`)
     }
 
+    this.db.exec('BEGIN')
     try {
-      this.withMutationSavepoint('rename', () => {
-        const existingNewIno = this.resolvePathToIno(newNormalized)
-        if (existingNewIno !== null) {
-          const existingInode = this.getInode(existingNewIno)
-          if (!existingInode) {
-            throw this.createError('ENOENT', `rename '${newNormalized}'`)
-          }
-
-          if (this.isDirMode(existingInode.mode) && !this.isDirMode(oldInode.mode)) {
-            throw this.createError('EISDIR', `rename '${newNormalized}'`)
-          }
-          if (!this.isDirMode(existingInode.mode) && this.isDirMode(oldInode.mode)) {
-            throw this.createError('ENOTDIR', `rename '${newNormalized}'`)
-          }
-
-          if (this.isDirMode(existingInode.mode)) {
-            const child = this.db
-              .query('SELECT 1 as one FROM fs_dentry WHERE parent_ino = ? LIMIT 1')
-              .get(existingNewIno) as { one: number } | undefined
-            if (child) {
-              throw this.createError('ENOTEMPTY', `rename '${newNormalized}'`)
-            }
-          }
-
-          this.removeDentryAndMaybeInode(
-            newParent.parentIno,
-            newParent.name,
-            existingNewIno,
-          )
+      const existingNewIno = this.resolvePathToIno(newNormalized)
+      if (existingNewIno !== null) {
+        const existingInode = this.getInode(existingNewIno)
+        if (!existingInode) {
+          throw this.createError('ENOENT', `rename '${newNormalized}'`)
         }
 
-        this.db
-          .query(
-            'UPDATE fs_dentry SET parent_ino = ?, name = ? WHERE parent_ino = ? AND name = ?',
-          )
-          .run(newParent.parentIno, newParent.name, oldParent.parentIno, oldParent.name)
+        if (this.isDirMode(existingInode.mode) && !this.isDirMode(oldInode.mode)) {
+          throw this.createError('EISDIR', `rename '${newNormalized}'`)
+        }
+        if (!this.isDirMode(existingInode.mode) && this.isDirMode(oldInode.mode)) {
+          throw this.createError('ENOTDIR', `rename '${newNormalized}'`)
+        }
 
-        const now = nowSec()
-        this.db
-          .query('UPDATE fs_inode SET ctime = ? WHERE ino = ?')
-          .run(now, oldIno)
-      })
+        if (this.isDirMode(existingInode.mode)) {
+          const child = this.db
+            .query('SELECT 1 as one FROM fs_dentry WHERE parent_ino = ? LIMIT 1')
+            .get(existingNewIno) as { one: number } | undefined
+          if (child) {
+            throw this.createError('ENOTEMPTY', `rename '${newNormalized}'`)
+          }
+        }
+
+        this.removeDentryAndMaybeInode(
+          newParent.parentIno,
+          newParent.name,
+          existingNewIno,
+        )
+      }
+
+      this.db
+        .query(
+          'UPDATE fs_dentry SET parent_ino = ?, name = ? WHERE parent_ino = ? AND name = ?',
+        )
+        .run(newParent.parentIno, newParent.name, oldParent.parentIno, oldParent.name)
+
+      const now = nowSec()
+      this.db
+        .query('UPDATE fs_inode SET ctime = ? WHERE ino = ?')
+        .run(now, oldIno)
+      this.db.exec('COMMIT')
     } catch (e) {
+      this.db.exec('ROLLBACK')
       if (e instanceof Error && 'code' in e) {
         throw e
       }
@@ -1446,11 +1358,12 @@ export class CryptograftAFS extends BaseFilesystem {
       throw this.createError('ENOENT', `rmdir '${normalized}'`)
     }
 
+    this.db.exec('BEGIN')
     try {
-      this.withMutationSavepoint('rmdir', () => {
-        this.removeDentryAndMaybeInode(parent.parentIno, parent.name, ino)
-      })
+      this.removeDentryAndMaybeInode(parent.parentIno, parent.name, ino)
+      this.db.exec('COMMIT')
     } catch (e) {
+      this.db.exec('ROLLBACK')
       throw this.createError('EIO', `rmdir '${normalized}'`, e)
     }
   }
@@ -1481,65 +1394,64 @@ export class CryptograftAFS extends BaseFilesystem {
     const table = chunkTableName(ino)
     const chunkSize = inode.chunk_size || this.chunkSize
 
+    this.db.exec('BEGIN')
     try {
-      this.withMutationSavepoint('truncate', () => {
-        const cryptoContext = this.loadFileCryptoContext(ino, false)
-        if (len === 0) {
-          this.db.query(`DELETE FROM ${table}`).run()
-        } else if (len < inode.size) {
-          const lastChunk = Math.floor((len - 1) / chunkSize)
-          this.db
-            .query(`DELETE FROM ${table} WHERE chunk_index > ?`)
-            .run(lastChunk)
+      const cryptoContext = this.loadFileCryptoContext(ino, false)
+      if (len === 0) {
+        this.db.query(`DELETE FROM ${table}`).run()
+      } else if (len < inode.size) {
+        const lastChunk = Math.floor((len - 1) / chunkSize)
+        this.db
+          .query(`DELETE FROM ${table} WHERE chunk_index > ?`)
+          .run(lastChunk)
 
-          const keep = len % chunkSize
-          if (keep > 0) {
-            const row = this.db
-              .query(`SELECT meta, data FROM ${table} WHERE chunk_index = ?`)
-              .get(lastChunk) as
-                | { meta: Uint8Array | null; data: Uint8Array }
-                | undefined
-            if (row?.data) {
-              let chunk: Buffer
-              if (row.meta) {
-                if (!cryptoContext) {
-                  throw this.createError(
-                    'EIO',
-                    `Encrypted chunk found without passphrase for '${normalized}'`,
-                  )
-                }
-                try {
-                  chunk = Buffer.from(
-                    this.decryptChunk(row.data, row.meta, lastChunk, cryptoContext),
-                  )
-                } catch (cause) {
-                  throw this.createError('EIO', `Chunk authentication failed for '${normalized}'`, cause)
-                }
-              } else {
-                chunk = Buffer.from(row.data)
+        const keep = len % chunkSize
+        if (keep > 0) {
+          const row = this.db
+            .query(`SELECT meta, data FROM ${table} WHERE chunk_index = ?`)
+            .get(lastChunk) as
+              | { meta: Uint8Array | null; data: Uint8Array }
+              | undefined
+          if (row?.data) {
+            let chunk: Buffer
+            if (row.meta) {
+              if (!cryptoContext) {
+                throw this.createError(
+                  'EIO',
+                  `Encrypted chunk found without passphrase for '${normalized}'`,
+                )
               }
+              try {
+                chunk = Buffer.from(
+                  this.decryptChunk(row.data, row.meta, lastChunk, cryptoContext),
+                )
+              } catch (cause) {
+                throw this.createError('EIO', `Chunk authentication failed for '${normalized}'`, cause)
+              }
+            } else {
+              chunk = Buffer.from(row.data)
+            }
 
-              const truncated = chunk.subarray(0, keep)
-              const truncateStmt = this.db.query(`
-                UPDATE ${table}
-                SET meta = ?, data = ?
-                WHERE chunk_index = ?
-              `)
-              if (cryptoContext) {
-                const encrypted = this.encryptChunk(truncated, lastChunk, cryptoContext)
-                truncateStmt.run(encrypted.meta, encrypted.data, lastChunk)
-              } else {
-                truncateStmt.run(null, truncated, lastChunk)
-              }
+            const truncated = chunk.subarray(0, keep)
+            if (cryptoContext) {
+              const encrypted = this.encryptChunk(truncated, lastChunk, cryptoContext)
+              this.db
+                .query(`UPDATE ${table} SET meta = ?, data = ? WHERE chunk_index = ?`)
+                .run(encrypted.meta, encrypted.data, lastChunk)
+            } else {
+              this.db
+                .query(`UPDATE ${table} SET meta = NULL, data = ? WHERE chunk_index = ?`)
+                .run(truncated, lastChunk)
             }
           }
         }
+      }
 
-        const now = nowSec()
-        this.db
-          .query('UPDATE fs_inode SET size = ?, mtime = ?, ctime = ? WHERE ino = ?')
-          .run(len, now, now, ino)
-      })
+      const now = nowSec()
+      this.db
+        .query('UPDATE fs_inode SET size = ?, mtime = ?, ctime = ? WHERE ino = ?')
+        .run(len, now, now, ino)
+      this.db.exec('COMMIT')
 
       for (const file of this.openFiles.values()) {
         if (file.ino === ino) {
@@ -1550,6 +1462,7 @@ export class CryptograftAFS extends BaseFilesystem {
         }
       }
     } catch (e) {
+      this.db.exec('ROLLBACK')
       throw this.createError('EIO', `truncate '${normalized}'`, e)
     }
   }
@@ -1578,11 +1491,12 @@ export class CryptograftAFS extends BaseFilesystem {
       throw this.createError('ENOENT', `unlink '${normalized}'`)
     }
 
+    this.db.exec('BEGIN')
     try {
-      this.withMutationSavepoint('unlink', () => {
-        this.removeDentryAndMaybeInode(parent.parentIno, parent.name, ino)
-      })
+      this.removeDentryAndMaybeInode(parent.parentIno, parent.name, ino)
+      this.db.exec('COMMIT')
     } catch (e) {
+      this.db.exec('ROLLBACK')
       throw this.createError('EIO', `unlink '${normalized}'`, e)
     }
   }
@@ -1598,7 +1512,6 @@ export class CryptograftAFS extends BaseFilesystem {
     this.db
       .query('UPDATE fs_inode SET atime = ?, mtime = ? WHERE ino = ?')
       .run(toSec(atime), toSec(mtime), ino)
-    this.dirtySinceSync = true
   }
 
   writeFile(

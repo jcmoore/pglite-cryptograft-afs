@@ -7,12 +7,15 @@ import type { CryptograftAFSOptions } from '../src/index.js'
 import {
   cleanupTestDir,
   createCryptograftPGlite,
+  createCryptograftOldPGlite,
   createEncryptedPGlite,
   createTestDir,
 } from './helpers/bench-utils.js'
 import { generateInsertSQL } from './helpers/bench-utils.js'
 
 interface MatrixVariant {
+  implementation: 'current' | 'old'
+  contentEncryption: 'encrypted' | 'plain'
   pageSizeKb: number
   chunkSize: number
   keyed: boolean
@@ -22,8 +25,8 @@ interface MatrixVariant {
 interface MatrixState {
   variant: MatrixVariant
   dir: string
-  db: Awaited<ReturnType<typeof createCryptograftPGlite>>['db']
-  fs: Awaited<ReturnType<typeof createCryptograftPGlite>>['fs']
+  db: PGlite
+  fs: { destroy: () => void | Promise<void> }
 }
 
 const SCHEMA = `
@@ -45,6 +48,30 @@ function parseCsvInt(name: string, raw: string): number[] {
     throw new Error(`Invalid ${name}: '${raw}'`)
   }
   return parsed
+}
+
+function parseImplementations(raw: string): Array<'current' | 'old'> {
+  const parsed = raw
+    .split(',')
+    .map((part) => part.trim().toLowerCase())
+    .filter((part) => part.length > 0)
+
+  if (parsed.length === 0) {
+    throw new Error(`Invalid CRYPTOGRAFT_MATRIX_IMPLEMENTATIONS: '${raw}'`)
+  }
+
+  const out: Array<'current' | 'old'> = []
+  for (const impl of parsed) {
+    if (impl !== 'current' && impl !== 'old') {
+      throw new Error(
+        `Unsupported implementation '${impl}'. Allowed values: current, old`,
+      )
+    }
+    if (!out.includes(impl)) {
+      out.push(impl)
+    }
+  }
+  return out
 }
 
 function sqliteLibSuffix(): string {
@@ -89,6 +116,9 @@ const chunkSizes = parseCsvInt(
   'CRYPTOGRAFT_MATRIX_CHUNK_SIZES',
   process.env.CRYPTOGRAFT_MATRIX_CHUNK_SIZES ?? '8192',
 )
+const implementations = parseImplementations(
+  process.env.CRYPTOGRAFT_MATRIX_IMPLEMENTATIONS ?? 'current',
+)
 
 const graftVariantsDir = process.env.GRAFT_EXT_VARIANTS_DIR
   ? path.resolve(process.env.GRAFT_EXT_VARIANTS_DIR)
@@ -129,20 +159,34 @@ if (!fs.existsSync(graftExtPath)) {
   )
 }
 
-for (const chunkSize of chunkSizes) {
-  variants.push({
-    pageSizeKb,
-    chunkSize,
-    keyed: false,
-    label: `cryptograft[unkeyed p=${pageSizeKb}k chunk=${chunkSize}]`,
-  })
-  if (sqlite3mcPath) {
-    variants.push({
-      pageSizeKb,
-      chunkSize,
-      keyed: true,
-      label: `cryptograft[keyed p=${pageSizeKb}k chunk=${chunkSize}]`,
-    })
+for (const implementation of implementations) {
+  const contentModes: Array<'encrypted' | 'plain'> =
+    implementation === 'current' ? ['encrypted', 'plain'] : ['encrypted']
+
+  for (const contentEncryption of contentModes) {
+    const encLabel = contentEncryption === 'plain' ? 'noenc' : 'enc'
+    const implLabel = implementation === 'current' ? 'cryptograft' : 'cryptograft-old'
+
+    for (const chunkSize of chunkSizes) {
+      variants.push({
+        implementation,
+        contentEncryption,
+        pageSizeKb,
+        chunkSize,
+        keyed: false,
+        label: `${implLabel}[${encLabel} unkeyed p=${pageSizeKb}k chunk=${chunkSize}]`,
+      })
+      if (sqlite3mcPath) {
+        variants.push({
+          implementation,
+          contentEncryption,
+          pageSizeKb,
+          chunkSize,
+          keyed: true,
+          label: `${implLabel}[${encLabel} keyed p=${pageSizeKb}k chunk=${chunkSize}]`,
+        })
+      }
+    }
   }
 }
 
@@ -172,6 +216,7 @@ await encryptedDb.exec(SCHEMA)
 await encryptedDb.exec(SEED_SQL)
 
 const states: MatrixState[] = []
+let sqliteLibraryConfigured = false
 
 for (const variant of variants) {
   const dir = createTestDir()
@@ -179,13 +224,14 @@ for (const variant of variants) {
   const options: CryptograftAFSOptions = {
     chunkSize: variant.chunkSize,
     sqlitePageSize: variant.pageSizeKb * 1024,
-    graftTag: `bench-cryptograft-p${variant.pageSizeKb}k-c${variant.chunkSize}-${variant.keyed ? 'keyed' : 'unkeyed'}-${states.length}`,
+    graftTag: `bench-${variant.implementation}-${variant.contentEncryption}-p${variant.pageSizeKb}k-c${variant.chunkSize}-${variant.keyed ? 'keyed' : 'unkeyed'}-${states.length}`,
   }
   if (states.length === 0) {
     options.graftExtensionPath = graftExtPath
   }
-  if (sqliteLibraryPath) {
+  if (sqliteLibraryPath && !sqliteLibraryConfigured) {
     options.sqliteLibraryPath = sqliteLibraryPath
+    sqliteLibraryConfigured = true
   }
   if (variant.keyed) {
     options.pragmas = [
@@ -194,7 +240,11 @@ for (const variant of variants) {
     ]
   }
 
-  const { db, fs: cgfs } = await createCryptograftPGlite(dir, undefined, options)
+  const passphrase = variant.contentEncryption === 'plain' ? null : 'test-passphrase'
+  const { db, fs: cgfs } =
+    variant.implementation === 'old'
+      ? await createCryptograftOldPGlite(dir, undefined, options, 'test-passphrase')
+      : await createCryptograftPGlite(dir, undefined, options, passphrase)
   await db.exec(SCHEMA)
   await db.exec(SEED_SQL)
 

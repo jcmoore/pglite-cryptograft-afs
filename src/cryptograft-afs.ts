@@ -44,6 +44,8 @@ const WASM_PREFIX = '/tmp/pglite'
 const PGDATA = WASM_PREFIX + '/base'
 let bunSQLiteInitialized = false
 let configuredSQLiteLibraryPath: string | null = null
+let graftExtensionInitialized = false
+let configuredGraftExtensionPath: string | null = null
 
 await sodium.ready
 
@@ -296,13 +298,6 @@ export function initializeCryptograftDatabase(
   }
 
   process.env.GRAFT_CONFIG = graftConfigPath
-  process.env.GRAFT_DATA_DIR = graftDataDir
-  process.env.GRAFT_REMOTE__TYPE = graftRemoteType
-  if (graftRemoteType === 'fs') {
-    process.env.GRAFT_REMOTE__ROOT = graftRemoteRoot
-  } else {
-    delete process.env.GRAFT_REMOTE__ROOT
-  }
 
   const graftExtensionPath = options.graftExtensionPath ?? process.env.GRAFT_EXT_DYLIB
   if (!graftExtensionPath) {
@@ -330,9 +325,21 @@ export function initializeCryptograftDatabase(
     }
   }
 
-  const bootstrap = new BunDatabase(':memory:')
-  bootstrap.loadExtension(graftExtensionPath)
-  bootstrap.close()
+  if (!graftExtensionInitialized) {
+    const bootstrap = new BunDatabase(':memory:')
+    bootstrap.loadExtension(graftExtensionPath)
+    bootstrap.close()
+    graftExtensionInitialized = true
+    configuredGraftExtensionPath = graftExtensionPath
+  } else if (
+    configuredGraftExtensionPath &&
+    configuredGraftExtensionPath !== graftExtensionPath
+  ) {
+    throw new Error(
+      `Graft extension already configured with '${configuredGraftExtensionPath}'. ` +
+        `Requested '${graftExtensionPath}'.`,
+    )
+  }
 
   const graftTag = options.graftTag ?? DEFAULT_GRAFT_TAG
   const dbUri = `file:${graftTag}?vfs=graft`
@@ -541,42 +548,28 @@ export class CryptograftAFS extends BaseFilesystem {
         throw new Error('Invalid passphrase or corrupted encryption keys')
       }
 
-      const fileId = Buffer.from(randomBytes(CHUNK_HEADER_FILE_ID_SIZE))
-      const header = Buffer.concat([this.cryptoSalt, fileId])
-      const nonce = Buffer.from(randomBytes(CHUNK_NONCE_SIZE))
-      const aad = buildChunkAad(fileId, 0)
-      const encrypted = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt_detached(
-        VERIFICATION_MAGIC,
-        aad,
-        null,
-        nonce,
-        this.keys.encKey,
-      )
-      const meta = buildChunkMeta(nonce, Buffer.from(encrypted.mac))
-      const data = Buffer.from(encrypted.ciphertext)
+      const context: FileCryptoContext = {
+        fileId: Buffer.from(randomBytes(CHUNK_HEADER_FILE_ID_SIZE)),
+      }
+      const header = Buffer.concat([this.cryptoSalt, context.fileId])
+      const encrypted = this.encryptChunk(VERIFICATION_MAGIC, 0, context)
 
       this.db
         .query('INSERT INTO fs_verification (name, header, meta, data) VALUES (?, ?, ?, ?)')
-        .run(VERIFICATION_TOKEN_NAME, header, meta, data)
+        .run(VERIFICATION_TOKEN_NAME, header, encrypted.meta, encrypted.data)
     } else {
       try {
         const parsedHeader = parseFileHeader(row.header)
         if (!parsedHeader.salt.equals(this.cryptoSalt)) {
           throw new Error('Verification token salt mismatch')
         }
-  
-        const parsedMeta = parseChunkMeta(row.meta)
-        const aad = buildChunkAad(Buffer.from(parsedHeader.fileId), 0)
-        const plaintext = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt_detached(
-          null,
-          row.data,
-          parsedMeta.tag,
-          aad,
-          parsedMeta.nonce,
-          this.keys.encKey,
-        )
-  
-        if (!Buffer.from(plaintext).equals(VERIFICATION_MAGIC)) {
+
+        const context: FileCryptoContext = {
+          fileId: Buffer.from(parsedHeader.fileId),
+        }
+        const plaintext = this.decryptChunk(row.data, row.meta, 0, context)
+
+        if (!plaintext.equals(VERIFICATION_MAGIC)) {
           throw new Error('Verification token mismatch')
         }
       } catch (cause) {

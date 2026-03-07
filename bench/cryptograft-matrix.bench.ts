@@ -2,6 +2,7 @@ import { afterAll, bench, describe } from 'vitest'
 import * as path from 'node:path'
 import * as fs from 'node:fs'
 import { PGlite } from '@electric-sql/pglite'
+import { Database as BunDatabase } from 'bun:sqlite'
 import type { CryptograftAFSOptions } from '../src/index.js'
 import {
   cleanupTestDir,
@@ -63,9 +64,21 @@ function sqlQuote(value: string): string {
   return value.replace(/'/g, "''")
 }
 
-function hasPlainSqliteHeader(dbPath: string): boolean {
-  const header = fs.readFileSync(dbPath).subarray(0, 16)
-  return header.equals(Buffer.from('SQLite format 3\0', 'utf8'))
+function canReadMetadata(tag: string, key?: { cipher: string; key: string }): boolean {
+  let db: BunDatabase | null = null
+  try {
+    db = new BunDatabase(`file:${tag}?vfs=graft`)
+    if (key) {
+      db.exec(`PRAGMA cipher = '${sqlQuote(key.cipher)}';`)
+      db.exec(`PRAGMA key = '${sqlQuote(key.key)}';`)
+    }
+    db.query('SELECT count(*) AS c FROM sqlite_master').get()
+    db.close()
+    return true
+  } catch {
+    if (db) db.close()
+    return false
+  }
 }
 
 const pagesizesKb = parseCsvInt(
@@ -82,7 +95,12 @@ const graftVariantsDir = process.env.GRAFT_EXT_VARIANTS_DIR
   : path.resolve(process.cwd(), 'artifacts/graft')
 
 const extensionSuffix = sqliteLibSuffix()
-const sqlite3mcPath = process.env.SQLITE3MC_DYLIB
+const sqliteLibraryPath = process.env.SQLITE_DYLIB ?? process.env.SQLITE3MC_DYLIB
+const sqlite3mcPath =
+  process.env.SQLITE3MC_DYLIB &&
+  /sqlite3mc/i.test(path.basename(process.env.SQLITE3MC_DYLIB))
+    ? process.env.SQLITE3MC_DYLIB
+    : undefined
 const sqliteCipher = process.env.SQLITE3MC_CIPHER ?? 'xchacha20'
 const sqliteKey = process.env.SQLITE3MC_KEY ?? 'bench-passphrase'
 
@@ -130,7 +148,7 @@ for (const chunkSize of chunkSizes) {
 
 if (!sqlite3mcPath) {
   console.warn(
-    "[bench:matrix] SQLITE3MC_DYLIB is not set; keyed cryptograft contenders were skipped.",
+    '[bench:matrix] sqlite3mc library not detected; keyed sqlite3mc contenders were skipped.',
   )
 }
 
@@ -161,12 +179,13 @@ for (const variant of variants) {
   const options: CryptograftAFSOptions = {
     chunkSize: variant.chunkSize,
     sqlitePageSize: variant.pageSizeKb * 1024,
+    graftTag: `bench-cryptograft-p${variant.pageSizeKb}k-c${variant.chunkSize}-${variant.keyed ? 'keyed' : 'unkeyed'}-${states.length}`,
   }
   if (states.length === 0) {
     options.graftExtensionPath = graftExtPath
   }
-  if (sqlite3mcPath) {
-    options.sqliteLibraryPath = sqlite3mcPath
+  if (sqliteLibraryPath) {
+    options.sqliteLibraryPath = sqliteLibraryPath
   }
   if (variant.keyed) {
     options.pragmas = [
@@ -179,13 +198,21 @@ for (const variant of variants) {
   await db.exec(SCHEMA)
   await db.exec(SEED_SQL)
 
-  const metadataPath = path.join(dir, '.cryptograft-fs.sqlite')
-  const hasPlainHeader = hasPlainSqliteHeader(metadataPath)
-  if (variant.keyed && hasPlainHeader) {
-    throw new Error(`Expected keyed cryptograft metadata db to be encrypted: ${metadataPath}`)
+  const canReadUnkeyed = canReadMetadata(options.graftTag!)
+  if (variant.keyed && canReadUnkeyed) {
+    throw new Error(`Expected keyed cryptograft metadata db to reject unkeyed reads for tag '${options.graftTag}'`)
   }
-  if (!variant.keyed && !hasPlainHeader) {
-    throw new Error(`Expected unkeyed cryptograft metadata db to be plaintext: ${metadataPath}`)
+  if (!variant.keyed && !canReadUnkeyed) {
+    throw new Error(`Expected unkeyed cryptograft metadata db to allow unkeyed reads for tag '${options.graftTag}'`)
+  }
+  if (variant.keyed) {
+    const canReadWithKey = canReadMetadata(options.graftTag!, {
+      cipher: sqliteCipher,
+      key: sqliteKey,
+    })
+    if (!canReadWithKey) {
+      throw new Error(`Expected keyed cryptograft metadata db to allow keyed reads for tag '${options.graftTag}'`)
+    }
   }
 
   states.push({

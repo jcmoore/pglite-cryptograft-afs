@@ -12,12 +12,13 @@ case "$(uname -s)" in
   *) DYLIB_EXT="dylib" ;;
 esac
 
-SQLITE3MC_DYLIB="${SQLITE3MC_DYLIB:-${ARTIFACTS_DIR}/libsqlite3mc.${DYLIB_EXT}}"
+SQLITE_DYLIB="${SQLITE_DYLIB:-${ARTIFACTS_DIR}/libsqlite3.${DYLIB_EXT}}"
+SQLITE3MC_DYLIB="${SQLITE3MC_DYLIB:-${SQLITE_DYLIB}}"
 GRAFT_EXT_DYLIB="${GRAFT_EXT_DYLIB:-${ARTIFACTS_DIR}/graft/libgraft_ext.pagesize4k.${DYLIB_EXT}}"
 
 if [[ ! -f "${SQLITE3MC_DYLIB}" ]]; then
-  echo "sqlite3mc library not found: ${SQLITE3MC_DYLIB}" >&2
-  echo "Build it first with: npm run build:sqlite3mc" >&2
+  echo "sqlite library not found: ${SQLITE3MC_DYLIB}" >&2
+  echo "Build it first with: npm run build:sqlite3 (or npm run build:sqlite3mc)" >&2
   exit 1
 fi
 

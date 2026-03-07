@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { Database as BunDatabase } from 'bun:sqlite'
-import * as path from 'node:path'
 import {
   createTestDir,
   cleanupTestDir,
@@ -89,11 +88,11 @@ describe('CryptograftAFS', () => {
   })
 
   it('initializes metadata sqlite with 4KB page size', async () => {
-    const fs = createCryptograftAFS(testDir)
+    const tag = 'cryptograft-test.pagesize4k'
+    const fs = createCryptograftAFS(testDir, { graftTag: tag })
     await fs.destroy()
 
-    const dbPath = path.join(testDir, '.cryptograft-fs.sqlite')
-    const db = new BunDatabase(dbPath)
+    const db = new BunDatabase(`file:${tag}?vfs=graft`)
     const row = db.query('PRAGMA page_size').get() as { page_size: number }
     db.close()
 
@@ -101,11 +100,11 @@ describe('CryptograftAFS', () => {
   })
 
   it('supports explicit metadata sqlite page size override', async () => {
-    const fs = createCryptograftAFS(testDir, { sqlitePageSize: 8192 })
+    const tag = 'cryptograft-test.pagesize8k'
+    const fs = createCryptograftAFS(testDir, { sqlitePageSize: 8192, graftTag: tag })
     await fs.destroy()
 
-    const dbPath = path.join(testDir, '.cryptograft-fs.sqlite')
-    const db = new BunDatabase(dbPath)
+    const db = new BunDatabase(`file:${tag}?vfs=graft`)
     const row = db.query('PRAGMA page_size').get() as { page_size: number }
     db.close()
 

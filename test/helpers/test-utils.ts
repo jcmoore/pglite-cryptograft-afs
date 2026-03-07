@@ -7,6 +7,7 @@ import {
   type DerivedKeys,
 } from '../../src/index.js'
 import { PGlite } from '@electric-sql/pglite'
+import { createHash } from 'node:crypto'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
@@ -72,7 +73,13 @@ export function createCryptograftAFS(
   options: CryptograftAFSOptions = {},
   passphrase = 'test-passphrase',
 ): CryptograftAFS {
-  return new CryptograftAFS(dataDir, passphrase, options)
+  const tagSuffix = createHash('sha1').update(dataDir).digest('hex').slice(0, 16)
+  const defaultOptions: CryptograftAFSOptions = {
+    graftRemoteType: 'fs',
+    graftRemoteRoot: path.join(dataDir, '.cryptograft-graft', 'remote'),
+    graftTag: `cryptograft-test.${tagSuffix}`,
+  }
+  return new CryptograftAFS(dataDir, passphrase, { ...defaultOptions, ...options })
 }
 
 /**

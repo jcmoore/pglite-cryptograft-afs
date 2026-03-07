@@ -3,7 +3,7 @@
 Date: 2026-03-05 (America/Chicago)
 
 ## Scope
-This note documents the reproducible panic seen during `PRAGMA graft_import = ...` when importing the cryptograft metadata SQLite database (`.cryptograft-fs.sqlite`) in the pglite sync example flow.
+This note documents the reproducible panic seen during `PRAGMA graft_import = ...` when importing the cryptograft metadata SQLite database (`.cryptograft-afs.sqlite`) in the pglite sync example flow.
 
 Panic message:
 
@@ -65,8 +65,8 @@ This behavior is the same for both sqlite3mc and plain upstream SQLite runtime.
 - Result: success (`imported 2 pages`)
 
 ### Control B: cryptograft metadata DB import (unkeyed) under same 4k graft path
-- Created `.cryptograft-fs.sqlite` via `CryptograftAFS` with 4k metadata page size
-- Imported via `PRAGMA graft_import = '.cryptograft-fs.sqlite'`
+- Created `.cryptograft-afs.sqlite` via `CryptograftAFS` with 4k metadata page size
+- Imported via `PRAGMA graft_import = '.cryptograft-afs.sqlite'`
 - Result: panic (`Invalid PageSet: Splinter contains PageIdx 0`)
 
 ## Test Status

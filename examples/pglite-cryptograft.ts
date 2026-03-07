@@ -100,8 +100,8 @@ async function main(): Promise<void> {
   const clientTwoConfig = join(tempRoot, 'graft-client-2.toml')
   const pgliteOneDataDir = join(tempRoot, 'pglite-1')
   const pgliteTwoDataDir = join(tempRoot, 'pglite-2')
-  const sqliteOnePath = join(pgliteOneDataDir, '.cryptograft-fs.sqlite')
-  const sqliteTwoPath = join(pgliteTwoDataDir, '.cryptograft-fs.sqlite')
+  const sqliteOnePath = join(pgliteOneDataDir, '.cryptograft-afs.sqlite')
+  const sqliteTwoPath = join(pgliteTwoDataDir, '.cryptograft-afs.sqlite')
   const controlDbUri = 'file:cryptograft-sync?vfs=graft'
 
   mkdirSync(sharedRemoteRoot, { recursive: true })

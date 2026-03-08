@@ -156,14 +156,52 @@ export interface CryptograftAFSOptions {
   graftRemoteRoot?: string
 }
 
-function resolveSqlitePageSize(value: number | undefined): number {
-  const pageSize = value ?? DEFAULT_SQLITE_PAGE_SIZE
+function validateSqlitePageSize(pageSize: number): number {
   if (!ALLOWED_SQLITE_PAGE_SIZES.has(pageSize)) {
     throw new Error(
       `Unsupported sqlitePageSize '${pageSize}'. Allowed values: 4096, 8192, 16384, 32768, 65536.`,
     )
   }
   return pageSize
+}
+
+export function inferSqlitePageSizeFromGraftExtensionPath(
+  graftExtensionPath: string | undefined,
+): number | null {
+  if (!graftExtensionPath) return null
+  const basename = path.basename(graftExtensionPath)
+  const match = basename.match(/pagesize(4|8|16|32|64)k/i)
+  if (!match) return null
+  const pageSizeKb = match[1]
+  if (!pageSizeKb) return null
+  return Number.parseInt(pageSizeKb, 10) * 1024
+}
+
+function resolveSqlitePageSizeForGraft(
+  sqlitePageSize: number | undefined,
+  graftExtensionPath: string | undefined,
+): number {
+  const inferredPageSize = inferSqlitePageSizeFromGraftExtensionPath(graftExtensionPath)
+  if (sqlitePageSize !== undefined) {
+    const explicitPageSize = validateSqlitePageSize(sqlitePageSize)
+    if (inferredPageSize !== null && explicitPageSize !== inferredPageSize) {
+      throw new Error(
+        `sqlitePageSize ${explicitPageSize} does not match graft extension page size ${inferredPageSize} inferred from '${graftExtensionPath}'.`,
+      )
+    }
+    return explicitPageSize
+  }
+
+  if (inferredPageSize !== null) {
+    return inferredPageSize
+  }
+
+  if (graftExtensionPath) {
+    console.warn(
+      `Could not infer page size from graft extension '${graftExtensionPath}'; defaulting sqlitePageSize to ${DEFAULT_SQLITE_PAGE_SIZE}.`,
+    )
+  }
+  return DEFAULT_SQLITE_PAGE_SIZE
 }
 
 function emFlagsToNode(flags: number | string): string {
@@ -459,7 +497,10 @@ export class CryptograftAFS extends BaseFilesystem {
 
     const baseDir = this.dataDir ?? dataDir
     this.chunkSize = options.chunkSize ?? DEFAULT_CHUNK_SIZE
-    this.sqlitePageSize = resolveSqlitePageSize(options.sqlitePageSize)
+    this.sqlitePageSize = resolveSqlitePageSizeForGraft(
+      options.sqlitePageSize,
+      options.graftExtensionPath ?? process.env.GRAFT_EXT_DYLIB,
+    )
     this.ownsDB = !db;
     this.encryptionEnabled = passphrase !== null
 

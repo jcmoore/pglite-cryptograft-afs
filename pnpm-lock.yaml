@@ -7,6 +7,13 @@ settings:
 importers:
 
   .:
+    dependencies:
+      '@types/libsodium-wrappers-sumo':
+        specifier: ^0.7.8
+        version: 0.7.8
+      libsodium-wrappers-sumo:
+        specifier: ^0.8.2
+        version: 0.8.2
     devDependencies:
       '@electric-sql/pglite':
         specifier: ^0.3.15
@@ -401,6 +408,13 @@ packages:
   '@types/json-schema@7.0.15':
     resolution: {integrity: sha512-5+fP8P8MFNC+AyZCDxrB2pkZFPGzqQWUzpSeuuVLvm8VMcorNYavBqoFcxK8bQz4Qsbn4oUEEem4wDLfcysGHA==}
 
+  '@types/libsodium-wrappers-sumo@0.7.8':
+    resolution: {integrity: sha512-N2+df4MB/A+W0RAcTw7A5oxKgzD+Vh6Ye7lfjWIi5SdTzVLfHPzxUjhwPqHLO5Ev9fv/+VHl+sUaUuTg4fUPqw==}
+
+  '@types/libsodium-wrappers@0.8.2':
+    resolution: {integrity: sha512-+2IDfSULPUskSjIYfZl9suIUsIE5PXwoKZiE/j0MZWd+M9nEGvJDsk/ztMZKNhL1lBL+1CaypW0dQSjqPW2dMg==}
+    deprecated: This is a stub types definition. libsodium-wrappers provides its own type definitions, so you do not need this installed.
+
   '@types/node@25.3.0':
     resolution: {integrity: sha512-4K3bqJpXpqfg2XKGK9bpDTc6xO/xoUP/RBWS7AtRMug6zZFaRekiLzjVtAoZMquxoAbzBvy5nxQ7veS5eYzf8A==}
 
@@ -681,6 +695,18 @@ packages:
   levn@0.4.1:
     resolution: {integrity: sha512-+bT2uH4E5LGE7h/n3evcS/sQlJXCpIp6ym8OWJ5eV6+67Dsql/LaaT7qJBAt2rzfoa/5QBGBhxDix1dMt2kQKQ==}
     engines: {node: '>= 0.8.0'}
+
+  libsodium-sumo@0.8.2:
+    resolution: {integrity: sha512-uMgnjphJ717jLN+jFG1HUgNrK/gOVVfaO1DGZ1Ig/fKLKLVhvaH/sM1I1v784JFvmkJDaczDpi7xSYC4Jvdo1Q==}
+
+  libsodium-wrappers-sumo@0.8.2:
+    resolution: {integrity: sha512-wd1xAY++Kr6VMikSaa4EPRAHJmFvNlGWiiwU3Jh3GR1zRYF3/I3vy/wYsr4k3LVsNzwb9sqfEQ4LdVQ6zEebyQ==}
+
+  libsodium-wrappers@0.8.2:
+    resolution: {integrity: sha512-VFLmfxkxo+U9q60tjcnSomQBRx2UzlRjKWJqvB4K1pUqsMQg4cu3QXA2nrcsj9A1qRsnJBbi2Ozx1hsiDoCkhw==}
+
+  libsodium@0.8.2:
+    resolution: {integrity: sha512-TsnGYMoZtpweT+kR+lOv5TVsnJ/9U0FZOsLFzFOMWmxqOAYXjX3fsrPAW+i1LthgDKXJnI9A8dWEanT1tnJKIw==}
 
   locate-path@6.0.0:
     resolution: {integrity: sha512-iPZK6eYjbxRu3uB4/WZ3EsEIMJFMqAoopl3R+zuq0UjcAm/MO6KCweDgPfP3elTztoKP3KtnVHxTn2NHBSDVUw==}
@@ -1147,6 +1173,14 @@ snapshots:
 
   '@types/json-schema@7.0.15': {}
 
+  '@types/libsodium-wrappers-sumo@0.7.8':
+    dependencies:
+      '@types/libsodium-wrappers': 0.8.2
+
+  '@types/libsodium-wrappers@0.8.2':
+    dependencies:
+      libsodium-wrappers: 0.8.2
+
   '@types/node@25.3.0':
     dependencies:
       undici-types: 7.18.2
@@ -1484,6 +1518,18 @@ snapshots:
     dependencies:
       prelude-ls: 1.2.1
       type-check: 0.4.0
+
+  libsodium-sumo@0.8.2: {}
+
+  libsodium-wrappers-sumo@0.8.2:
+    dependencies:
+      libsodium-sumo: 0.8.2
+
+  libsodium-wrappers@0.8.2:
+    dependencies:
+      libsodium: 0.8.2
+
+  libsodium@0.8.2: {}
 
   locate-path@6.0.0:
     dependencies:

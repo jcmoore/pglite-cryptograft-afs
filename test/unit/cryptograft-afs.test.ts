@@ -5,6 +5,7 @@ import {
   cleanupTestDir,
   createCryptograftAFS,
 } from '../helpers/test-utils.js'
+import { inferSqlitePageSizeFromGraftExtensionPath } from '../../src/cryptograft-afs.js'
 
 describe('CryptograftAFS', () => {
   let testDir: string
@@ -112,15 +113,22 @@ describe('CryptograftAFS', () => {
     expect(row.page_size).toBe(4096)
   })
 
-  it('supports explicit metadata sqlite page size override', async () => {
+  it('rejects explicit sqlite page size override that mismatches graft extension page size', () => {
     const tag = 'cryptograft-test.pagesize8k'
-    const fs = createCryptograftAFS(testDir, { sqlitePageSize: 8192, graftTag: tag })
-    await fs.destroy()
+    expect(() =>
+      createCryptograftAFS(testDir, { sqlitePageSize: 8192, graftTag: tag })
+    ).toThrow(/does not match graft extension page size 4096/)
+  })
 
-    const db = new BunDatabase(`file:${tag}?vfs=graft`)
-    const row = db.query('PRAGMA page_size').get() as { page_size: number }
-    db.close()
+  it('infers sqlite page size from graft extension filename (4k)', () => {
+    expect(
+      inferSqlitePageSizeFromGraftExtensionPath('/tmp/libgraft_ext.pagesize4k.dylib'),
+    ).toBe(4096)
+  })
 
-    expect(row.page_size).toBe(8192)
+  it('infers sqlite page size from graft extension filename (8k)', () => {
+    expect(
+      inferSqlitePageSizeFromGraftExtensionPath('/tmp/libgraft_ext.pagesize8k.so'),
+    ).toBe(8192)
   })
 })

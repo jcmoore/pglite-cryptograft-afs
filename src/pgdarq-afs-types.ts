@@ -13,6 +13,7 @@ export interface PgdarqAFSEncryptionOptions {
 }
 
 export interface PgdarqAFSOptions {
+  brokerPort?: MessagePort
   brokerWorker?: Worker
   bootstrapMemoryThresholdBytes?: number
   chunkSize?: number

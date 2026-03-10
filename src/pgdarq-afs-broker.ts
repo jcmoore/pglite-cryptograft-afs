@@ -1,4 +1,4 @@
-import { connect, type Database } from '@tursodatabase/database-wasm/vite'
+import { connect, type Database } from '@tursodatabase/database-wasm'
 import {
   decodeSyncRequest,
   encodeSyncError,
@@ -32,6 +32,20 @@ type ResolvedBrokerOptions = PgdarqAFSBrokerOptions & {
   persistentPath: string
 }
 
+export interface PgdarqAfsBrokerEndpoint {
+  addEventListener(
+    type: 'message' | 'error',
+    listener: EventListenerOrEventListenerObject,
+  ): void
+  postMessage(message: unknown): void
+  removeEventListener?(
+    type: 'message' | 'error',
+    listener: EventListenerOrEventListenerObject,
+  ): void
+  start?(): void
+  terminate?(): void
+}
+
 interface BrokerState {
   channel: PgdarqAfsSyncChannel | null
   dbMemory: Database | null
@@ -42,7 +56,7 @@ interface BrokerState {
   options: ResolvedBrokerOptions | null
 }
 
-const state: BrokerState = {
+const createBrokerState = (): BrokerState => ({
   channel: null,
   dbMemory: null,
   dbPersistent: null,
@@ -50,22 +64,43 @@ const state: BrokerState = {
   knownTablesPersistent: new Set<string>(),
   flushQueue: Promise.resolve(),
   options: null,
-}
+})
 
 export function startPgdarqAFSBroker(): void {
-  self.addEventListener('message', (event: MessageEvent<unknown>) => {
-    void handleMessage(event.data)
-  })
+  attachPgdarqAFSBroker(self as unknown as PgdarqAfsBrokerEndpoint)
 }
 
-async function handleMessage(message: unknown): Promise<void> {
+export function attachPgdarqAFSBroker(endpoint: PgdarqAfsBrokerEndpoint): {
+  close: () => Promise<void>
+} {
+  const state = createBrokerState()
+  const onMessage = ((event: MessageEvent<unknown>): void => {
+    void handleMessage(endpoint, state, event.data)
+  }) as EventListener
+
+  endpoint.addEventListener('message', onMessage)
+  endpoint.start?.()
+
+  return {
+    close: async () => {
+      endpoint.removeEventListener?.('message', onMessage)
+      await closeBroker(state)
+    },
+  }
+}
+
+async function handleMessage(
+  endpoint: PgdarqAfsBrokerEndpoint,
+  state: BrokerState,
+  message: unknown,
+): Promise<void> {
   if (
     typeof message === 'object' &&
     message !== null &&
     'type' in message &&
     message.type === 'pgdarq-afs:init'
   ) {
-    await handleInit(message as PgdarqAfsBrokerInitMessage)
+    await handleInit(endpoint, state, message as PgdarqAfsBrokerInitMessage)
     return
   }
 
@@ -75,29 +110,35 @@ async function handleMessage(message: unknown): Promise<void> {
     'type' in message &&
     message.type === 'pgdarq-afs:sync'
   ) {
-    await handleSyncRead(message as PgdarqAfsBrokerSyncMessage)
+    await handleSyncRead(state, message as PgdarqAfsBrokerSyncMessage)
     return
   }
 
   if (typeof message === 'object' && message !== null && 'id' in message) {
     const request = message as PgdarqAfsBrokerRequestMessage
-    await respond(request.id, async () => {
+    await respond(endpoint, request.id, async () => {
       switch (request.payload.type) {
         case 'snapshot':
           return await loadSnapshot(state.dbPersistent!, normalizeChunkSize(state.options?.chunkSize))
         case 'flush':
-          return await flushBatch(request.payload.batch, request.payload.strict)
+          return await flushBatch(state, request.payload.batch, request.payload.strict)
         case 'close':
-          await closeBroker()
+          await closeBroker(state)
           return { closed: true as const }
         default:
-          throw new Error(`Unknown broker request: ${String((request as { payload?: { type?: string } }).payload?.type)}`)
+          throw new Error(
+            `Unknown broker request: ${String((request as { payload?: { type?: string } }).payload?.type)}`,
+          )
       }
     })
   }
 }
 
-async function handleInit(message: PgdarqAfsBrokerInitMessage): Promise<void> {
+async function handleInit(
+  endpoint: PgdarqAfsBrokerEndpoint,
+  state: BrokerState,
+  message: PgdarqAfsBrokerInitMessage,
+): Promise<void> {
   state.channel = message.channel
   state.options = normalizeBrokerOptions(message.options as PgdarqAFSBrokerOptions)
   const options = state.options
@@ -118,18 +159,21 @@ async function handleInit(message: PgdarqAfsBrokerInitMessage): Promise<void> {
   await ensureDatabase(state.dbPersistent, options.chunkSize)
   await ensureDatabase(state.dbMemory, options.chunkSize)
   const snapshot = await loadSnapshot(state.dbPersistent, options.chunkSize)
-  await seedMemoryDatabase(snapshot)
+  await seedMemoryDatabase(state, snapshot)
   state.knownTablesPersistent = await loadKnownTables(state.dbPersistent)
   state.knownTablesMemory = await loadKnownTables(state.dbMemory)
 
-  postMessage({
+  endpoint.postMessage({
     id: 0,
     ok: true,
     payload: snapshot,
   } satisfies PgdarqAfsBrokerResponseMessage)
 }
 
-async function handleSyncRead(_message: PgdarqAfsBrokerSyncMessage): Promise<void> {
+async function handleSyncRead(
+  state: BrokerState,
+  _message: PgdarqAfsBrokerSyncMessage,
+): Promise<void> {
   if (!state.channel || !state.dbMemory || !state.dbPersistent) {
     return
   }
@@ -138,7 +182,7 @@ async function handleSyncRead(_message: PgdarqAfsBrokerSyncMessage): Promise<voi
     const request = decodeSyncRequest(state.channel)
     switch (request.kind) {
       case 'readChunk': {
-        const payload = await readChunk(request.ino, request.chunkIndex)
+        const payload = await readChunk(state, request.ino, request.chunkIndex)
         encodeSyncResponse(state.channel, {
           kind: 'readChunk',
           found: payload !== null,
@@ -163,18 +207,19 @@ function normalizeBrokerOptions(options: PgdarqAFSBrokerOptions): ResolvedBroker
 }
 
 async function respond(
+  endpoint: PgdarqAfsBrokerEndpoint,
   id: number,
   fn: () => Promise<PgdarqAfsSnapshot | { strictCompleted: boolean } | { closed: true }>,
 ): Promise<void> {
   try {
     const payload = await fn()
-    postMessage({
+    endpoint.postMessage({
       id,
       ok: true,
       payload,
     } satisfies PgdarqAfsBrokerResponseMessage)
   } catch (error) {
-    postMessage({
+    endpoint.postMessage({
       id,
       ok: false,
       error: {
@@ -213,9 +258,7 @@ async function loadSnapshot(db: Database, chunkSize: number): Promise<PgdarqAfsS
 
   const schemaVersion = Number(config?.value ?? PGDARQ_AFS_SCHEMA_VERSION)
   if (schemaVersion !== PGDARQ_AFS_SCHEMA_VERSION) {
-    throw new Error(
-      `Unsupported pgdarq-afs schema version: ${schemaVersion}`,
-    )
+    throw new Error(`Unsupported pgdarq-afs schema version: ${schemaVersion}`)
   }
 
   const inodes = (await db.prepare(
@@ -244,7 +287,10 @@ async function loadSnapshot(db: Database, chunkSize: number): Promise<PgdarqAfsS
   }
 }
 
-async function seedMemoryDatabase(snapshot: PgdarqAfsSnapshot): Promise<void> {
+async function seedMemoryDatabase(
+  state: BrokerState,
+  snapshot: PgdarqAfsSnapshot,
+): Promise<void> {
   const db = state.dbMemory!
   await db.exec('BEGIN')
   try {
@@ -274,6 +320,7 @@ async function loadKnownTables(db: Database): Promise<Set<string>> {
 }
 
 async function readChunk(
+  state: BrokerState,
   ino: number,
   chunkIndex: number,
 ): Promise<PgdarqAfsChunkPayload | null> {
@@ -296,7 +343,7 @@ async function readChunk(
     return null
   }
 
-  await ensureChunkTable(state.dbMemory!, 'memory', ino)
+  await ensureChunkTable(state, state.dbMemory!, 'memory', ino)
   await upsertChunkRecord(state.dbMemory!, {
     ino,
     chunkIndex,
@@ -327,23 +374,25 @@ async function getChunkFromDatabase(
 }
 
 async function flushBatch(
+  state: BrokerState,
   batch: PgdarqAfsFlushBatch,
   strict: boolean,
 ): Promise<{ strictCompleted: boolean }> {
-  await applyBatchToDatabase(state.dbMemory!, 'memory', batch)
+  await applyBatchToDatabase(state, state.dbMemory!, 'memory', batch)
 
   if (strict) {
-    await applyBatchToDatabase(state.dbPersistent!, 'persistent', batch)
+    await applyBatchToDatabase(state, state.dbPersistent!, 'persistent', batch)
     return { strictCompleted: true }
   }
 
   state.flushQueue = state.flushQueue.then(async () => {
-    await applyBatchToDatabase(state.dbPersistent!, 'persistent', batch)
+    await applyBatchToDatabase(state, state.dbPersistent!, 'persistent', batch)
   })
   return { strictCompleted: false }
 }
 
 async function applyBatchToDatabase(
+  state: BrokerState,
   db: Database,
   role: DatabaseRole,
   batch: PgdarqAfsFlushBatch,
@@ -351,7 +400,7 @@ async function applyBatchToDatabase(
   await db.exec('BEGIN')
   try {
     for (const ino of batch.createdTables) {
-      await ensureChunkTable(db, role, ino)
+      await ensureChunkTable(state, db, role, ino)
     }
 
     for (const deleted of batch.deletedDentries) {
@@ -365,7 +414,7 @@ async function applyBatchToDatabase(
     }
 
     for (const deleted of batch.deletedChunks) {
-      if (!hasKnownTable(role, deleted.ino)) {
+      if (!hasKnownTable(state, role, deleted.ino)) {
         continue
       }
       await db.prepare(
@@ -374,7 +423,7 @@ async function applyBatchToDatabase(
     }
 
     for (const chunk of batch.upsertChunks) {
-      await ensureChunkTable(db, role, chunk.ino)
+      await ensureChunkTable(state, db, role, chunk.ino)
       await upsertChunkRecord(db, chunk)
     }
 
@@ -383,9 +432,9 @@ async function applyBatchToDatabase(
     }
 
     for (const ino of batch.deletedInodes) {
-      if (hasKnownTable(role, ino)) {
+      if (hasKnownTable(state, role, ino)) {
         await db.exec(`DROP TABLE IF EXISTS ${dataTableIdentifier(ino)}`)
-        knownTables(role).delete(dataTableName(ino))
+        knownTables(state, role).delete(dataTableName(ino))
       }
       await db.prepare(`DELETE FROM fs_inode WHERE ino = ?`).run(ino)
       await db.prepare(`DELETE FROM fs_dentry WHERE ino = ? OR parent_ino = ?`).run(
@@ -401,21 +450,22 @@ async function applyBatchToDatabase(
   }
 }
 
-function knownTables(role: DatabaseRole): Set<string> {
+function knownTables(state: BrokerState, role: DatabaseRole): Set<string> {
   return role === 'memory' ? state.knownTablesMemory : state.knownTablesPersistent
 }
 
-function hasKnownTable(role: DatabaseRole, ino: number): boolean {
-  return knownTables(role).has(dataTableName(ino))
+function hasKnownTable(state: BrokerState, role: DatabaseRole, ino: number): boolean {
+  return knownTables(state, role).has(dataTableName(ino))
 }
 
 async function ensureChunkTable(
+  state: BrokerState,
   db: Database,
   role: DatabaseRole,
   ino: number,
 ): Promise<void> {
   const tableName = dataTableName(ino)
-  if (knownTables(role).has(tableName)) {
+  if (knownTables(state, role).has(tableName)) {
     return
   }
 
@@ -426,7 +476,7 @@ async function ensureChunkTable(
       data BLOB NOT NULL
     )`,
   )
-  knownTables(role).add(tableName)
+  knownTables(state, role).add(tableName)
 }
 
 async function upsertInodeRecord(db: Database, inode: PgdarqAfsInodeRecord): Promise<void> {
@@ -487,10 +537,15 @@ async function upsertChunkRecord(db: Database, chunk: PgdarqAfsChunkRecord): Pro
   ).run(chunk.chunkIndex, chunk.meta, chunk.data)
 }
 
-async function closeBroker(): Promise<void> {
+async function closeBroker(state: BrokerState): Promise<void> {
   await state.flushQueue
   await state.dbMemory?.close()
   await state.dbPersistent?.close()
+  state.channel = null
   state.dbMemory = null
   state.dbPersistent = null
+  state.options = null
+  state.knownTablesMemory.clear()
+  state.knownTablesPersistent.clear()
+  state.flushQueue = Promise.resolve()
 }

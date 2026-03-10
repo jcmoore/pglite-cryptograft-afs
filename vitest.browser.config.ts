@@ -7,6 +7,9 @@ const isolationHeaders = {
 }
 
 export default defineConfig({
+  optimizeDeps: {
+    exclude: ['@tursodatabase/database-wasm'],
+  },
   server: {
     headers: isolationHeaders,
   },

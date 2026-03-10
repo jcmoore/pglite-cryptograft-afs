@@ -27,6 +27,7 @@ import {
   type PgdarqAfsSnapshot,
 } from './pgdarq-afs-schema.js'
 import type { PgdarqAFSOptions } from './pgdarq-afs-types.js'
+import type { PgdarqAfsBrokerEndpoint } from './pgdarq-afs-broker.js'
 
 const EIO = 5
 const O_WRONLY = 1
@@ -35,6 +36,7 @@ const O_CREAT = 64
 const O_EXCL = 128
 const O_TRUNC = 512
 const O_APPEND = 1024
+const BROKER_INIT_TIMEOUT_MS = 15000
 
 interface FilesystemError extends Error {
   pgSymbol: string
@@ -74,7 +76,7 @@ export class PgdarqAFS extends BaseFilesystem {
     }
   >()
 
-  private brokerWorker: Worker | undefined
+  private brokerEndpoint: PgdarqAfsBrokerEndpoint | undefined
   private createdBrokerWorker = false
   private syncChannel?: PgdarqAfsSyncChannel
   private cwd = '/'
@@ -99,14 +101,50 @@ export class PgdarqAFS extends BaseFilesystem {
 
     this.pg = pg
     this.syncChannel = createSyncChannel()
-    this.brokerWorker = this.options.brokerWorker ?? createPgdarqAFSBrokerWorker()
-    this.createdBrokerWorker = !this.options.brokerWorker
-    this.brokerWorker.addEventListener('message', this.onBrokerMessage)
+    this.brokerEndpoint =
+      this.options.brokerPort ??
+      this.options.brokerWorker ??
+      createPgdarqAFSBrokerWorker()
+    this.createdBrokerWorker = !this.options.brokerPort && !this.options.brokerWorker
+    this.brokerEndpoint.start?.()
+    this.brokerEndpoint.addEventListener('message', this.onBrokerMessage as EventListener)
 
     const snapshotPromise = new Promise<PgdarqAfsSnapshot>((resolve, reject) => {
+      const brokerEndpoint = this.brokerEndpoint!
+      const timeout = setTimeout(() => {
+        cleanup()
+        reject(
+          new Error(
+            `PgdarqAFS broker worker initialization timed out after ${BROKER_INIT_TIMEOUT_MS}ms`,
+          ),
+        )
+      }, BROKER_INIT_TIMEOUT_MS)
+
+      const onError = (event: ErrorEvent): void => {
+        cleanup()
+        reject(
+          new Error(
+            `PgdarqAFS broker worker failed during init: ${event.message || 'Unknown worker error'}`,
+          ),
+        )
+      }
+
+      const cleanup = (): void => {
+        clearTimeout(timeout)
+        brokerEndpoint.removeEventListener?.('error', onError as EventListener)
+        this.pendingRequests.delete(0)
+      }
+
+      brokerEndpoint.addEventListener('error', onError as EventListener)
       this.pendingRequests.set(0, {
-        resolve: (value) => resolve(value as PgdarqAfsSnapshot),
-        reject,
+        resolve: (value) => {
+          cleanup()
+          resolve(value as PgdarqAfsSnapshot)
+        },
+        reject: (error) => {
+          cleanup()
+          reject(error)
+        },
       })
     })
 
@@ -121,7 +159,7 @@ export class PgdarqAFS extends BaseFilesystem {
       },
     }
 
-    this.brokerWorker.postMessage(initMessage)
+    this.brokerEndpoint.postMessage(initMessage)
     const snapshot = await snapshotPromise
     this.hydrateSnapshot(snapshot)
 
@@ -153,7 +191,7 @@ export class PgdarqAFS extends BaseFilesystem {
       await this.syncToFs(false)
     }
 
-    if (this.brokerWorker) {
+    if (this.brokerEndpoint) {
       try {
         await this.callBroker({
           id: this.nextRequestId++,
@@ -162,11 +200,11 @@ export class PgdarqAFS extends BaseFilesystem {
       } catch (_error) {
         // Ignore shutdown errors while tearing the worker down.
       }
-      this.brokerWorker.removeEventListener('message', this.onBrokerMessage)
+      this.brokerEndpoint.removeEventListener?.('message', this.onBrokerMessage as EventListener)
       if (this.createdBrokerWorker) {
-        this.brokerWorker.terminate()
+        this.brokerEndpoint.terminate?.()
       }
-      this.brokerWorker = undefined
+      this.brokerEndpoint = undefined
     }
   }
 
@@ -496,13 +534,13 @@ export class PgdarqAFS extends BaseFilesystem {
   }
 
   private async callBroker<T>(request: PgdarqAfsBrokerRequestMessage): Promise<T> {
-    if (!this.brokerWorker) {
+    if (!this.brokerEndpoint) {
       throw new Error('PgdarqAFS broker worker is not initialized')
     }
 
     return await new Promise<T>((resolve, reject) => {
       this.pendingRequests.set(request.id, { resolve: resolve as (value: unknown) => void, reject })
-      this.brokerWorker!.postMessage(request)
+      this.brokerEndpoint!.postMessage(request)
     })
   }
 
@@ -540,7 +578,7 @@ export class PgdarqAFS extends BaseFilesystem {
       return dirty
     }
 
-    if (!this.syncChannel || !this.brokerWorker) {
+    if (!this.syncChannel || !this.brokerEndpoint) {
       return null
     }
 
@@ -549,7 +587,7 @@ export class PgdarqAFS extends BaseFilesystem {
       ino,
       chunkIndex,
     })
-    this.brokerWorker.postMessage({ type: 'pgdarq-afs:sync' })
+    this.brokerEndpoint.postMessage({ type: 'pgdarq-afs:sync' })
 
     const control = new Int32Array(this.syncChannel.control)
     const result = Atomics.wait(control, 0, PGDARQ_SYNC_STATE_IDLE, 10000)

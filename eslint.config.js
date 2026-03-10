@@ -49,4 +49,14 @@ export default tseslint.config(
       eqeqeq: ['error'],
     },
   },
+
+  {
+    files: ['bench/scripts/**/*.mjs'],
+    languageOptions: {
+      globals: {
+        URL: 'readonly',
+        console: 'readonly',
+      },
+    },
+  },
 )

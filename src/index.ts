@@ -1,4 +1,9 @@
 export { EncryptedFS, type EncryptedFSOptions } from './encrypted-fs.js'
+export { PgdarqAFS } from './pgdarq-afs.js'
+export type {
+  PgdarqAFSBrokerOptions,
+  PgdarqAFSOptions,
+} from './pgdarq-afs-types.js'
 
 export {
   PAGE_SIZE,

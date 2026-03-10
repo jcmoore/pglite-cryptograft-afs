@@ -9,6 +9,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./browser": {
+      "types": "./dist/browser.d.ts",
+      "import": "./dist/browser.js"
     }
   },
   "files": [
@@ -23,7 +27,12 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier --write \"src/**/*.{ts,js}\"",
     "test": "vitest run",
+    "test:browser": "vitest run --config vitest.browser.config.ts",
     "test:watch": "vitest",
+    "bench:node": "vitest bench --config vitest.bench.config.ts",
+    "bench:browser": "vitest bench --config vitest.browser.bench.config.ts",
+    "bench:compare": "node ./bench/scripts/compare-results.mjs",
+    "bench:report": "node ./bench/scripts/render-report.mjs",
     "bench": "vitest bench --config vitest.bench.config.ts",
     "prepublishOnly": "pnpm run typecheck && pnpm run lint && pnpm run build"
   },
@@ -59,10 +68,15 @@
     "@electric-sql/pglite": "^0.3.15",
     "@eslint/js": "^10.0.1",
     "@types/node": "^25.3.0",
+    "@vitest/browser-playwright": "^4.0.18",
     "eslint": "^10.0.1",
+    "playwright": "^1.58.2",
     "prettier": "^3.8.1",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.56.0",
     "vitest": "^4.0.18"
+  },
+  "dependencies": {
+    "@tursodatabase/database-wasm": "^0.5.1"
   }
 }
